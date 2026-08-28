@@ -24,6 +24,8 @@
 #include <random>
 #include <limits>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <cerrno>
 #include <sstream>
 #include <cmath>
 
@@ -106,26 +108,32 @@ struct IOMMUDomainManager {
         if (!allowed_domains.empty()) {
             for (int32_t d : allowed_domains) {
                 if (domain_sizes[d] + size <= max_domain_size) {
+                    // Check the allocator context BEFORE charging the domain
+                    // size, so a failed context creation (see
+                    // ensure_allocator_context) never hands back a domain id
+                    // whose accounting says it holds memory it doesn't.
+                    if (!ensure_allocator_context(d)) {
+                        return -1;
+                    }
                     domain_sizes[d] += size;
-                    ensure_allocator_context(d);
                     return d;
                 }
             }
 
             fprintf(stderr, "RKNPU ERROR: Out of memory in allowed IOMMU domains!\n");
-            assert(false);
             return -1;
         // Allocate dynamically
         } else {
             for (int32_t i = 0; i <= 15; ++i) {
                 if (domain_sizes[i] + size <= max_domain_size) {
+                    if (!ensure_allocator_context(i)) {
+                        return -1;
+                    }
                     domain_sizes[i] += size;
-                    ensure_allocator_context(i);
                     return i;
                 }
             }
             fprintf(stderr, "RKNPU ERROR: Out of memory in all IOMMU domains!\n");
-            assert(false);
             return -1;
         }
     }
@@ -143,28 +151,54 @@ struct IOMMUDomainManager {
         }
     }
 
-    // Function for getting a new dummy context in the required domain
+    // Function for getting a new dummy context in the required domain.
+    // Returns 0 (an invalid rknn_context handle, matching this file's
+    // existing "0 == unset/invalid" convention -- see rknpu_matmul_context's
+    // ctx field) if the context could not be created -- see
+    // ensure_allocator_context. Callers MUST check for 0 before passing the
+    // result to any rknn_create_mem*/rknn_destroy_mem*/rknn_matmul_* call.
     rknn_matmul_ctx get_allocator_context(int32_t domain_id) {
         std::lock_guard<std::mutex> lock(mutex);
-        ensure_allocator_context(domain_id);
+        if (!ensure_allocator_context(domain_id)) {
+            return 0;
+        }
         return allocator_contexts[domain_id];
     }
 
 private:
-    // Function for ensuring a dummy context existence in the required domain
-    void ensure_allocator_context(int32_t domain_id) {
-        if (allocator_contexts.find(domain_id) == allocator_contexts.end()) {
-            rknn_matmul_info info;
-            memset(&info, 0, sizeof(info));
-            info.M = 32; info.K = 32; info.N = 32;
-            info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
-            info.iommu_domain_id = domain_id;
-
-            rknn_matmul_io_attr io_attr;
-            rknn_matmul_ctx ctx = 0;
-            rknn_matmul_create(&ctx, &info, &io_attr);
-            allocator_contexts[domain_id] = ctx;
+    // Function for ensuring a dummy context existence in the required
+    // domain. Returns true if a valid (or already-cached) allocator context
+    // exists for domain_id, false if creation failed. On failure we
+    // deliberately do NOT insert into allocator_contexts, so a later call
+    // can retry -- the fd pressure causing the failure may be transient
+    // (other allocations freeing fds in the meantime).
+    bool ensure_allocator_context(int32_t domain_id) {
+        if (allocator_contexts.find(domain_id) != allocator_contexts.end()) {
+            return true;
         }
+
+        rknn_matmul_info info;
+        memset(&info, 0, sizeof(info));
+        info.M = 32; info.K = 32; info.N = 32;
+        info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+        info.iommu_domain_id = domain_id;
+
+        rknn_matmul_io_attr io_attr;
+        rknn_matmul_ctx ctx = 0;
+        int ret = rknn_matmul_create(&ctx, &info, &io_attr);
+        if (ret != RKNN_SUCC || ctx == 0) {
+            fprintf(stderr,
+                "RKNPU ERROR: rknn_matmul_create failed (ret=%d) creating the "
+                "dummy allocator context for IOMMU domain %d -- a likely "
+                "cause is RKNPU2 per-tensor dma-buf handle allocation "
+                "exhausting the process file-descriptor limit (librknnrt "
+                "reports 'failed to convert handle to fd, errno 24' in that "
+                "case); raise it, e.g. `ulimit -n 65536`\n",
+                ret, domain_id);
+            return false;
+        }
+        allocator_contexts[domain_id] = ctx;
+        return true;
     }
 };
 static IOMMUDomainManager g_domain_manager;
@@ -178,14 +212,44 @@ static IOMMUDomainManager g_domain_manager;
 static std::mutex g_debug_weight_mutex;
 static std::unordered_map<const struct ggml_tensor*, std::vector<float>> g_debug_weight_fp32;
 
-// Macro for RKNN API calls
+// Macros for RKNN API calls. NOTE (rk3576-emfile-fix-window-20260828): this
+// previously logged and then called assert(false) -- but this codebase's
+// CMake default (Release, which sets -DNDEBUG) is what actually ships, and
+// plain <cassert> assert() compiles to a no-op under NDEBUG. That made every
+// one of these checks a SILENT NO-OP in the real build: on failure it
+// printed one line and then FELL THROUGH, letting the caller run further
+// RKNN calls (including rknn_matmul_run) against a context/buffer that was
+// never actually bound -- a documented path to librknnrt crashing
+// downstream. These now log (including the fd-limit hint, since dma-buf
+// handle exhaustion is the most common cause of an RKNN call failing here)
+// and actually fail the operation instead of silently continuing.
+#define RKNN_LOG_FAILURE(ret, msg)                                            \
+    fprintf(stderr,                                                          \
+        "RKNN error %d at %s:%d: %s (a likely cause is RKNPU2 per-tensor "   \
+        "dma-buf handle allocation exhausting the process file-descriptor "  \
+        "limit -- librknnrt reports 'failed to convert handle to fd, errno " \
+        "24' in that case; raise it, e.g. `ulimit -n 65536`)\n",             \
+        ret, __FILE__, __LINE__, msg)
+
+// For use inside ggml_backend_rknpu_graph_compute() (returns enum ggml_status).
 #define RKNN_CHECK(stmt, msg)                                           \
     do {                                                                \
         int ret = (stmt);                                               \
         if (ret < 0) {                                                  \
-            fprintf(stderr,"RKNN error %d at %s:%d: %s\n", ret,         \
-                __FILE__, __LINE__, msg);                               \
-            assert(false);                                              \
+            RKNN_LOG_FAILURE(ret, msg);                                 \
+            return GGML_STATUS_FAILED;                                  \
+        }                                                               \
+    } while (0)
+
+// For use inside void-returning backend buffer callbacks (e.g. set_tensor),
+// where there is no status to return -- the caller must still bail out
+// cleanly rather than proceed with a call that failed.
+#define RKNN_CHECK_VOID(stmt, msg)                                      \
+    do {                                                                \
+        int ret = (stmt);                                               \
+        if (ret < 0) {                                                  \
+            RKNN_LOG_FAILURE(ret, msg);                                 \
+            return;                                                     \
         }                                                               \
     } while (0)
 
@@ -317,12 +381,55 @@ struct ggml_backend_rknpu_buffer_context {
                 RKNPU2_DBG("alloc RESIZE buf=%s offset=%zu old_size=%zu new_size=%zu old_fd=%d old_ptr=%p\n",
                     name.c_str(), tensor_offset, it->second.size, size, it->second.mem->fd, it->second.mem->virt_addr);
                 rknn_matmul_ctx old_ctx = g_domain_manager.get_allocator_context(it->second.iommu_domain_id);
-                rknn_destroy_mem(old_ctx, it->second.mem);
+                if (old_ctx != 0) {
+                    rknn_destroy_mem(old_ctx, it->second.mem);
+                } else {
+                    fprintf(stderr,
+                        "RKNPU2 WARNING: get_tensor_allocation RESIZE buf=%s "
+                        "offset=%zu -- could not re-acquire allocator context "
+                        "for old domain %d to free the old buffer (leaking it "
+                        "instead of calling rknn_destroy_mem with an invalid "
+                        "context) -- see prior RKNPU ERROR above\n",
+                        name.c_str(), tensor_offset, it->second.iommu_domain_id);
+                }
                 g_domain_manager.release_domain_memory(it->second.iommu_domain_id, it->second.size);
 
-                it->second.iommu_domain_id = g_domain_manager.assign_domain_memory(size);
-                rknn_matmul_ctx new_ctx = g_domain_manager.get_allocator_context(it->second.iommu_domain_id);
-                it->second.mem = rknn_create_mem(new_ctx, size);
+                // rk3576-emfile-fix-window-20260828: this resize path used to
+                // call rknn_create_mem() and dereference the result
+                // unconditionally (it->second.mem->fd / ->virt_addr a few
+                // lines below). Under fd-limit exhaustion (RKNPU2 allocates
+                // one dma-buf handle/fd per tensor buffer; librknnrt reports
+                // "failed to convert handle to fd, errno 24"), rknn_create_mem
+                // returns NULL and that dereference SIGSEGVs. The old buffer
+                // is already destroyed by this point (above), so on failure
+                // here we cannot fall back to it -- drop this tensor's
+                // allocation entirely and fail cleanly instead of crashing.
+                int32_t new_domain_id = g_domain_manager.assign_domain_memory(size);
+                rknn_matmul_ctx new_ctx = (new_domain_id >= 0) ? g_domain_manager.get_allocator_context(new_domain_id) : 0;
+                rknn_tensor_mem* new_mem = (new_ctx != 0) ? rknn_create_mem(new_ctx, size) : nullptr;
+
+                if (new_mem == nullptr) {
+                    if (new_domain_id >= 0) {
+                        g_domain_manager.release_domain_memory(new_domain_id, size);
+                    }
+                    fprintf(stderr,
+                        "RKNPU2 ERROR: get_tensor_allocation RESIZE buf=%s "
+                        "offset=%zu old_size=%zu new_size=%zu -- rknn_create_mem "
+                        "failed for the resized buffer; a likely cause is "
+                        "RKNPU2 per-tensor dma-buf handle allocation exhausting "
+                        "the process file-descriptor limit (librknnrt reports "
+                        "'failed to convert handle to fd, errno 24' in that "
+                        "case); raise it, e.g. `ulimit -n 65536`. The old "
+                        "buffer was already freed, so this tensor's allocation "
+                        "is now dropped -- failing cleanly instead of "
+                        "dereferencing a null buffer.\n",
+                        name.c_str(), tensor_offset, it->second.size, size);
+                    tensor_allocs.erase(it);
+                    return TensorAllocation{};
+                }
+
+                it->second.iommu_domain_id = new_domain_id;
+                it->second.mem = new_mem;
                 it->second.size = size;
                 RKNPU2_DBG("alloc RESIZE-DONE buf=%s offset=%zu new_fd=%d new_ptr=%p align64=%zu\n",
                     name.c_str(), tensor_offset, it->second.mem->fd, it->second.mem->virt_addr,
@@ -334,17 +441,58 @@ struct ggml_backend_rknpu_buffer_context {
             return it->second;
         }
 
-        // Acquiring a domain for allocation
+        // Acquiring a domain for allocation. rk3576-emfile-fix-window-20260828:
+        // this new-allocation path used to call rknn_create_mem() and only
+        // guard the result with GGML_ASSERT (which aborts the whole process --
+        // not the graceful "fail this op, keep the process alive" behavior we
+        // want) and the domain/context acquisition above it was entirely
+        // unchecked. Both are now checked and fail cleanly, returning a
+        // sentinel TensorAllocation{} (mem=nullptr) that every caller must
+        // (and now does) check before dereferencing.
         int32_t domain_id = g_domain_manager.assign_domain_memory(size);
+        if (domain_id < 0) {
+            fprintf(stderr,
+                "RKNPU2 ERROR: get_tensor_allocation buf=%s offset=%zu "
+                "size=%zu -- no IOMMU domain available (see prior RKNPU "
+                "ERROR above); failing this tensor allocation cleanly "
+                "instead of dereferencing a null buffer\n",
+                name.c_str(), tensor_offset, size);
+            return TensorAllocation{};
+        }
+
         rknn_matmul_ctx alloc_ctx = g_domain_manager.get_allocator_context(domain_id);
+        if (alloc_ctx == 0) {
+            g_domain_manager.release_domain_memory(domain_id, size);
+            fprintf(stderr,
+                "RKNPU2 ERROR: get_tensor_allocation buf=%s offset=%zu "
+                "size=%zu domain=%d -- no allocator context available (see "
+                "prior RKNPU ERROR above); failing this tensor allocation "
+                "cleanly instead of dereferencing a null buffer\n",
+                name.c_str(), tensor_offset, size, domain_id);
+            return TensorAllocation{};
+        }
 
         // Allocating a new buffer for the tensor
+        rknn_tensor_mem* mem = rknn_create_mem(alloc_ctx, size);
+        if (mem == nullptr) {
+            g_domain_manager.release_domain_memory(domain_id, size);
+            fprintf(stderr,
+                "RKNPU2 ERROR: rknn_create_mem failed buf=%s offset=%zu "
+                "size=%zu domain=%d -- a likely cause is RKNPU2 per-tensor "
+                "dma-buf handle allocation exhausting the process "
+                "file-descriptor limit (librknnrt reports 'failed to convert "
+                "handle to fd, errno 24' in that case); raise it, e.g. "
+                "`ulimit -n 65536`. Failing this tensor allocation cleanly "
+                "instead of dereferencing a null buffer.\n",
+                name.c_str(), tensor_offset, size, domain_id);
+            return TensorAllocation{};
+        }
+
         TensorAllocation alloc;
-        alloc.mem = rknn_create_mem(alloc_ctx, size);
+        alloc.mem = mem;
         alloc.size = size;
         alloc.iommu_domain_id = domain_id;
 
-        GGML_ASSERT(alloc.mem != nullptr && "Failed to allocate tensor memory via RKNN API");
         RKNPU2_DBG("alloc MISS-NEW buf=%s offset=%zu size=%zu domain=%d fd=%d ptr=%p align64=%zu\n",
             name.c_str(), tensor_offset, size, domain_id, alloc.mem->fd, alloc.mem->virt_addr,
             (size_t)((uintptr_t)alloc.mem->virt_addr % 64));
@@ -502,7 +650,11 @@ static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
 
         std::lock_guard<std::mutex> lock(ctx->mutex);
         auto it = ctx->tensor_allocs.find(offset);
-        if (it != ctx->tensor_allocs.end()) {
+        // it->second.mem can be nullptr if a prior allocation for this
+        // tensor failed (rk3576-emfile-fix-window-20260828, e.g. fd-limit
+        // exhaustion) -- fall through to the raw tensor->data pointer below
+        // rather than dereferencing a null buffer.
+        if (it != ctx->tensor_allocs.end() && it->second.mem != nullptr) {
             return it->second.mem->virt_addr;
         }
     }
@@ -612,7 +764,24 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         {
             std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
             auto it = src0_buf_ctx->tensor_allocs.find(tensor_offset_in_virtual);
-            GGML_ASSERT(it != src0_buf_ctx->tensor_allocs.end() && "B-matrix RKNN buffer not found");
+            // rk3576-emfile-fix-window-20260828: this used to be a
+            // GGML_ASSERT that only checked presence in the map, then
+            // unconditionally dereferenced it->second.mem below. A tensor
+            // whose allocation failed (e.g. fd-limit exhaustion) is either
+            // absent from the map or present with mem==nullptr depending on
+            // which allocation path failed (see get_tensor_allocation) --
+            // check both and fail this op with an error status instead of
+            // aborting the whole process or dereferencing a null buffer.
+            if (it == src0_buf_ctx->tensor_allocs.end() || it->second.mem == nullptr) {
+                fprintf(stderr,
+                    "RKNPU2 ERROR: graph_compute tensor=%s -- B-matrix RKNN "
+                    "buffer missing or failed to allocate (a likely cause is "
+                    "the process file-descriptor limit; see prior RKNPU2 "
+                    "ERROR, and try `ulimit -n 65536`); failing this op "
+                    "cleanly instead of dereferencing a null buffer\n",
+                    src0->name);
+                return GGML_STATUS_FAILED;
+            }
 
             tensor_fd = it->second.mem->fd;
             tensor_virt_addr = it->second.mem->virt_addr;
@@ -1018,7 +1187,17 @@ static void ggml_backend_rknpu_buffer_free_buffer(ggml_backend_buffer_t buffer) 
                 g_active_rknpu_backend_ctx->invalidate_matmul_ctx_for_address(pair.second.mem->virt_addr);
             }
             rknn_matmul_ctx alloc_ctx = g_domain_manager.get_allocator_context(pair.second.iommu_domain_id);
-            rknn_destroy_mem(alloc_ctx, pair.second.mem);
+            if (alloc_ctx != 0) {
+                rknn_destroy_mem(alloc_ctx, pair.second.mem);
+            } else {
+                fprintf(stderr,
+                    "RKNPU2 WARNING: free_buffer buf=%s offset=%zu -- could "
+                    "not re-acquire allocator context for domain %d to free "
+                    "this buffer (leaking it instead of calling "
+                    "rknn_destroy_mem with an invalid context) -- see prior "
+                    "RKNPU ERROR above\n",
+                    ctx->name.c_str(), pair.first, pair.second.iommu_domain_id);
+            }
             g_domain_manager.release_domain_memory(pair.second.iommu_domain_id, pair.second.size);
         }
     }
@@ -1046,7 +1225,17 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
         size_t size = get_tensor_packed_size(tensor);
         RKNPU2_DBG("init_tensor tensor=%p name=%s buf=%s offset=%zu size=%zu\n",
             (const void*)tensor, tensor->name, ctx->name.c_str(), offset, size);
-        ctx->get_tensor_allocation(offset, size);
+        auto alloc = ctx->get_tensor_allocation(offset, size);
+        if (alloc.mem == nullptr) {
+            fprintf(stderr,
+                "RKNPU2 ERROR: buffer_init_tensor tensor=%s buf=%s offset=%zu "
+                "size=%zu -- RKNN buffer allocation failed (see prior "
+                "RKNPU2 ERROR above, likely fd-limit exhaustion; try "
+                "`ulimit -n 65536`); failing tensor init cleanly instead of "
+                "leaving a null buffer for later ops to dereference\n",
+                tensor->name, ctx->name.c_str(), offset, size);
+            return GGML_STATUS_FAILED;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1317,9 +1506,26 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
         }
 
-        // Allocating a new buffer for a tensor
+        // Allocating a new buffer for a tensor. rk3576-emfile-fix-window-
+        // 20260828: this used to dereference alloc.mem->virt_addr
+        // unconditionally -- get_tensor_allocation() returns mem==nullptr on
+        // allocation failure (e.g. fd-limit exhaustion / errno 24), which
+        // made this THE primary SIGSEGV site during model load. Check first
+        // and drop this set_tensor cleanly instead of crashing.
         size_t required_size = get_tensor_packed_size(tensor);
         auto alloc = ctx->get_tensor_allocation(tensor_offset_in_virtual, required_size);
+        if (alloc.mem == nullptr) {
+            fprintf(stderr,
+                "RKNPU2 ERROR: set_tensor tensor=%s buf=%s offset=%zu "
+                "required_size=%zu -- RKNN buffer allocation failed (see "
+                "prior RKNPU2 ERROR above, likely fd-limit exhaustion; try "
+                "`ulimit -n 65536`); dropping this set_tensor cleanly instead "
+                "of dereferencing a null buffer. This tensor's weights will "
+                "be missing/stale -- expect graph_compute to fail cleanly "
+                "for ops that read it.\n",
+                tensor->name, ctx->name.c_str(), tensor_offset_in_virtual, required_size);
+            return;
+        }
         uint8_t* tensor_dma_ptr = (uint8_t*)alloc.mem->virt_addr;
 
         // Computing specific hardware segments
@@ -1404,7 +1610,17 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         }
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
-        RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
+        if (sync_ctx == 0) {
+            fprintf(stderr,
+                "RKNPU2 ERROR: set_tensor tensor=%s buf=%s -- could not "
+                "re-acquire allocator context for domain %d to sync the "
+                "buffer to device (see prior RKNPU ERROR above); dropping "
+                "this set_tensor cleanly instead of calling into RKNN with "
+                "an invalid context\n",
+                tensor->name, ctx->name.c_str(), alloc.iommu_domain_id);
+            return;
+        }
+        RKNN_CHECK_VOID(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
         if (rknpu2_debug_enabled()) {
             uint8_t* pb = (uint8_t*)alloc.mem->virt_addr;
             RKNPU2_DBG("set_tensor DONE tensor=%p name=%s fd=%d ptr=%p first8_packed=%02x%02x%02x%02x%02x%02x%02x%02x\n",
@@ -1422,7 +1638,19 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
-    if (it == ctx->tensor_allocs.end()) {
+    // it->second.mem can be nullptr if a prior allocation for this tensor
+    // failed (rk3576-emfile-fix-window-20260828, e.g. fd-limit exhaustion) --
+    // treat that the same as "not found" and fall back to the raw backing
+    // bytes instead of dereferencing a null buffer below.
+    if (it == ctx->tensor_allocs.end() || it->second.mem == nullptr) {
+        if (it != ctx->tensor_allocs.end()) {
+            fprintf(stderr,
+                "RKNPU2 WARNING: get_tensor tensor=%s buf=%s offset=%zu -- "
+                "RKNN buffer allocation previously failed for this tensor "
+                "(see prior RKNPU2 ERROR above); returning raw backing bytes "
+                "instead of dereferencing a null buffer\n",
+                tensor->name, ctx->name.c_str(), tensor_offset_in_virtual);
+        }
         memcpy(data, (uint8_t*)tensor->data + offset, size);
         return;
     }
@@ -1501,6 +1729,10 @@ static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
     for (auto& pair : ctx->tensor_allocs) {
+        // Skip entries whose allocation previously failed
+        // (rk3576-emfile-fix-window-20260828, e.g. fd-limit exhaustion) --
+        // mem==nullptr there, and there is nothing to clear.
+        if (pair.second.mem == nullptr) continue;
         memset((uint8_t*)pair.second.mem->virt_addr, value, pair.second.size);
     }
 }
@@ -1652,9 +1884,77 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
     }
 }
 
+// Self-healing fd-limit raise (rk3576-emfile-fix-window-20260828). RKNPU2
+// allocates one dma-buf handle (and therefore one fd) per distinct tensor
+// buffer / matmul-context bind. On the common default 1024 soft
+// RLIMIT_NOFILE this is exhausted loading a mid-sized model, producing
+// librknnrt's "failed to convert handle to fd, errno 24" -- which, before
+// the checks added throughout this file, caused a SIGSEGV rather than a
+// clean failure. Try to raise the soft limit here so the backend is
+// self-healing without the operator needing to know to run
+// `ulimit -n 65536` first. This only ever WIDENS the soft limit up to the
+// process's own hard limit (setrlimit without CAP_SYS_RESOURCE cannot
+// exceed rlim_max), never lowers it, and any failure here is logged and
+// treated as non-fatal: the allocation-failure checks elsewhere in this
+// file are the real safety net, this is just a best-effort convenience.
+static void rknpu2_maybe_raise_fd_limit() {
+    const rlim_t kDesiredSoft = 65536;
+    const rlim_t kLowWatermark = 8192;
+
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        fprintf(stderr,
+            "RKNPU2: getrlimit(RLIMIT_NOFILE) failed (errno=%d: %s) -- "
+            "skipping self-raise; if you hit 'failed to convert handle to "
+            "fd, errno 24' during inference, run `ulimit -n 65536` before "
+            "starting this process\n", errno, strerror(errno));
+        return;
+    }
+
+    if (rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= kLowWatermark) {
+        RKNPU2_DBG("fd_limit already sufficient: soft=%lu hard=%lu\n",
+            (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max);
+        return;
+    }
+
+    rlim_t target = (rl.rlim_max == RLIM_INFINITY) ? kDesiredSoft
+                   : std::min(kDesiredSoft, rl.rlim_max);
+    if (target <= rl.rlim_cur) {
+        fprintf(stderr,
+            "RKNPU2 WARNING: RLIMIT_NOFILE soft=%lu is low and the hard "
+            "limit (%lu) does not allow raising it further -- RKNPU2 "
+            "allocates one fd per tensor buffer and may hit 'failed to "
+            "convert handle to fd, errno 24' on larger models. Ask an "
+            "admin to raise the hard limit (e.g. /etc/security/limits.conf "
+            "nofile), then `ulimit -n 65536` before starting this process.\n",
+            (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max);
+        return;
+    }
+
+    rlim_t old_soft = rl.rlim_cur;
+    rl.rlim_cur = target;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+        fprintf(stderr,
+            "RKNPU2 WARNING: setrlimit(RLIMIT_NOFILE, %lu) failed "
+            "(errno=%d: %s) -- continuing with the existing soft limit=%lu. "
+            "RKNPU2 allocates one fd per tensor buffer and may hit 'failed "
+            "to convert handle to fd, errno 24' on larger models; run "
+            "`ulimit -n 65536` before starting this process to avoid it.\n",
+            (unsigned long)target, errno, strerror(errno), (unsigned long)old_soft);
+        return;
+    }
+
+    fprintf(stderr,
+        "RKNPU2: raised RLIMIT_NOFILE soft limit %lu -> %lu (hard=%lu) to "
+        "avoid per-tensor dma-buf fd exhaustion\n",
+        (unsigned long)old_soft, (unsigned long)target, (unsigned long)rl.rlim_max);
+}
+
 static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     UNUSED(dev);
     UNUSED(params);
+
+    rknpu2_maybe_raise_fd_limit();
 
     // Fetch device from environment variable, default to RK3588 if not set
     const char* env_device = std::getenv("RKNPU_DEVICE");
