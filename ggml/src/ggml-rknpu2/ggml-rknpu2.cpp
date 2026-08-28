@@ -25,6 +25,7 @@
 #include <limits>
 #include <sys/mman.h>
 #include <sstream>
+#include <cmath>
 
 #define UNUSED(x) (void)(x)
 
@@ -167,6 +168,15 @@ private:
     }
 };
 static IOMMUDomainManager g_domain_manager;
+
+// --- Stage-5 A/C confession instrumentation (rk3576-stage5-20260828, env-gated) ---
+// Captures the full dequantized FP32 weight matrix (N x K, row-major by n)
+// for each B-matrix tensor as set_tensor() sees it, so graph_compute can
+// independently recompute the reference C on the CPU and diff it against
+// what the NPU actually produced -- isolating whether the bug is in the
+// A-matrix prep, the C-matrix collection math, or upstream of both.
+static std::mutex g_debug_weight_mutex;
+static std::unordered_map<const struct ggml_tensor*, std::vector<float>> g_debug_weight_fp32;
 
 // Macro for RKNN API calls
 #define RKNN_CHECK(stmt, msg)                                           \
@@ -761,6 +771,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         uint16_t* dst_ptr = (uint16_t*)dst_base;
                         uint16_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
                         rknpu2_quantization::convert_fp32_to_fp16(ready_row.data(), dst_row, K_seg_op);
+                        if (rknpu2_debug_enabled()) {
+                            double dbg_sum = 0; for (int dk = 0; dk < K_seg_op; ++dk) dbg_sum += ready_row[dk];
+                            fprintf(stderr, "[RKNPU2_DBG] A-CONV m=%d K_seg_op=%d k_off=%d src_first=%.6f src_last=%.6f src_sum=%.6f conv_first4=%04x,%04x,%04x,%04x conv_last=%04x\n",
+                                m, K_seg_op, k_seg.offset_k, ready_row[0], ready_row[K_seg_op-1], dbg_sum,
+                                dst_row[0], dst_row[1], dst_row[2], dst_row[3], dst_row[K_seg_op-1]);
+                            fflush(stderr);
+                        }
                     }
                     else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
                         float amax_m = 0.0f;
@@ -812,6 +829,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ==========================================
             {
                 if (rknpu2_debug_enabled()) {
+                    uint16_t* ar = (uint16_t*)mem_A_shared->virt_addr;
+                    fprintf(stderr, "[RKNPU2_DBG] PRE-RUN-A mem_A=%p ptr=%p M=%d M_op=%d K_seg_op=%d row0_first4=%04x,%04x,%04x,%04x\n",
+                        (void*)mem_A_shared.get(), mem_A_shared->virt_addr, M, M_op, K_seg_op, ar[0], ar[1], ar[2], ar[3]);
+                    fflush(stderr);
                     for (size_t idx = 0; idx < num_active_segments; idx++) {
                         auto& mc = matmul_ctxs[idx];
                         uint8_t* rb = mc->mem_B ? (uint8_t*)mc->mem_B->virt_addr : nullptr;
@@ -837,6 +858,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                 }
 
+                if (rknpu2_debug_enabled() && pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
+                    for (size_t idx = 0; idx < num_active_segments; idx++) {
+                        float* craw = (float*)mem_C_segments[idx]->virt_addr;
+                        int nseg = active_n_segments[idx].size_n;
+                        fprintf(stderr, "[RKNPU2_DBG] C-RAW idx=%zu M_op=%d N_seg=%d row0_first4=%.6f,%.6f,%.6f,%.6f row0_last=%.6f\n",
+                            idx, M_op, nseg, craw[0], craw[1], craw[2], craw[3], craw[nseg-1]);
+                    }
+                    fflush(stderr);
+                }
+
                 const float hadamard_divisor = pipeline->use_hadamard ? (float)K_op : 1.0f;
 
                 #pragma omp parallel for
@@ -856,6 +887,31 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                     float scale_B = wscale ? wscale[n] : 1.0f;
                                     float dequant_scale = (scales_A[m] * scale_B) / hadamard_divisor;
                                     dst_ptr[n] += src_ptr[n] * dequant_scale;
+                                }
+                            }
+                            if (rknpu2_debug_enabled() && !pipeline->use_hadamard && all_k_segments.size() == 1) {
+                                std::lock_guard<std::mutex> dbg_lock(g_debug_weight_mutex);
+                                auto dbg_it = g_debug_weight_fp32.find(src0);
+                                if (dbg_it != g_debug_weight_fp32.end() && (int)dbg_it->second.size() == N * K) {
+                                    const float* w = dbg_it->second.data();
+                                    const float* xr_base = (const float*)get_tensor_real_ptr(src1);
+                                    const int dbg_row_stride = (int)(src1->nb[1] / sizeof(float));
+                                    const float* xr = xr_base + (size_t)m * dbg_row_stride;
+                                    double max_abs_err = 0, max_rel_err = 0; int worst_n = -1;
+                                    for (int n = 0; n < N; ++n) {
+                                        double acc = 0;
+                                        for (int k = 0; k < K; ++k) acc += (double)xr[k] * (double)w[(size_t)n * K + k];
+                                        double got = dst_data[(size_t)m * N + n];
+                                        double err = fabs(got - acc);
+                                        double rel = err / (fabs(acc) + 1e-6);
+                                        if (err > max_abs_err) { max_abs_err = err; worst_n = n; }
+                                        if (rel > max_rel_err) max_rel_err = rel;
+                                        if (m == 0) fprintf(stderr, "[RKNPU2_DBG] C-CHECK m=%d n=%d got=%.6f ref=%.6f diff=%.6f ratio=%.6f\n",
+                                            m, n, got, acc, got - acc, (acc != 0.0) ? got/acc : 0.0);
+                                    }
+                                    fprintf(stderr, "[RKNPU2_DBG] C-CHECK-SUMMARY m=%d M=%d N=%d K=%d maxAbsErr=%.6f maxRelErr=%.6f worst_n=%d\n",
+                                        m, M, N, K, max_abs_err, max_rel_err, worst_n);
+                                    fflush(stderr);
                                 }
                             }
                             break;
@@ -1152,6 +1208,50 @@ static void pack_native(
     }
 }
 
+// Function for unpacking: the exact inverse of pack_native() above. Reads a
+// segment from the chip native tiled layout (src) and reconstructs the
+// compact [n_segment x k_segment] row-major buffer it was packed from
+// (dst), local to this segment (k_offset=0/n_offset=0 convention, matching
+// how pack_tensor_segment() calls pack_native() -- see Stage-5 fix in
+// ggml_backend_rknpu_buffer_get_tensor below).
+static void unpack_native(
+    uint8_t* dst, const uint8_t* src,
+    int k_segment, int k_align,
+    int n_segment, int n_align,
+    int element_bits)
+{
+    GGML_ASSERT(k_segment % k_align == 0 && "k_segment must be aligned to k_align");
+    GGML_ASSERT(n_segment % n_align == 0 && "n_segment must be aligned to n_align");
+
+    const size_t k_sub_bytes    = (size_t)k_align * element_bits / 8;
+    const size_t dst_row_bytes  = (size_t)k_segment * element_bits / 8;
+    const size_t n_blocks       = n_segment / n_align;
+    const size_t k_blocks       = k_segment / k_align;
+    const size_t kblock_stride  = (size_t)n_align * k_sub_bytes;
+    const size_t nblock_stride  = k_blocks * kblock_stride;
+
+    for (size_t ni = 0; ni < n_blocks; ++ni) {
+        for (size_t ki = 0; ki < k_blocks; ++ki) {
+            const uint8_t* src_tile = src + ni * nblock_stride + ki * kblock_stride;
+
+            for (int nn = 0; nn < n_align; ++nn) {
+                const size_t n_local  = ni * n_align + nn;
+                const size_t k_start  = ki * k_align;
+                const uint8_t* src_ptr = src_tile + nn * k_sub_bytes;
+                uint8_t* dst_ptr = dst + n_local * dst_row_bytes + k_start * element_bits / 8;
+
+                size_t off = 0;
+                for (; off + 16 <= k_sub_bytes; off += 16) {
+                    vst1q_u8(dst_ptr + off, vld1q_u8(src_ptr + off));
+                }
+                for (; off < k_sub_bytes; ++off) {
+                    dst_ptr[off] = src_ptr[off];
+                }
+            }
+        }
+    }
+}
+
 // Function for packing the quantized segment into the native NPU layout and writing to DMA
 static size_t pack_tensor_segment(
     const std::vector<uint8_t>& quantized_segment,
@@ -1247,6 +1347,25 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 // Dequantizing the block
                 dequantize_tensor_segment(seg_fp32, tensor, ctx, data, K, N, K_op, k_seg, n_seg, pipeline->use_hadamard);
 
+                // Stage-5 debug: stash this block's FP32 values into a full
+                // N x K side-buffer keyed by tensor pointer, for graph_compute's
+                // independent CPU cross-check (see g_debug_weight_fp32 above).
+                if (rknpu2_debug_enabled() && !pipeline->use_hadamard) {
+                    std::lock_guard<std::mutex> dbg_lock(g_debug_weight_mutex);
+                    auto& dbuf = g_debug_weight_fp32[tensor];
+                    if ((int)dbuf.size() != N * K) dbuf.assign((size_t)N * K, 0.0f);
+                    for (int i = 0; i < n_seg.size_n; ++i) {
+                        int global_n = n_seg.offset_n + i;
+                        if (global_n < N) {
+                            int ncols = std::min((int)k_seg.size_k, K - k_seg.offset_k);
+                            if (ncols > 0) {
+                                memcpy(&dbuf[(size_t)global_n * K + k_seg.offset_k],
+                                       &seg_fp32[(size_t)i * k_seg.size_k], ncols * sizeof(float));
+                            }
+                        }
+                    }
+                }
+
                 // Calculating per-channel scales of the segment
                 if (pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16) {
                     const float quant_divisor = (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) ? 7.0f : 127.0f;
@@ -1303,11 +1422,78 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
     auto it = ctx->tensor_allocs.find(tensor_offset_in_virtual);
-    if (it != ctx->tensor_allocs.end()) {
-        memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
-    } else {
+    if (it == ctx->tensor_allocs.end()) {
         memcpy(data, (uint8_t*)tensor->data + offset, size);
+        return;
     }
+
+    // Stage-5 fix (rk3576-stage5-20260828): for a "pipeline" tensor (a
+    // weight matmul routed through the NPU), the backing allocation holds
+    // the chip-native packed/quantized layout, NOT the tensor's declared
+    // row-major ggml format. Blindly memcpy-ing those bytes back (the old
+    // behavior, still used below for pipelines this fix doesn't cover) is
+    // harmless for real serving -- weights are write-once, never read back
+    // -- but ggml_backend_compare_graph_backend (test-backend-ops MODE_TEST)
+    // DOES read input tensors back to build its CPU reference. That silently
+    // fed the CPU reference scrambled native-tiled bytes reinterpreted as
+    // row-major FP16, producing the "FAIL ERR=1.6-4.2" results Stages 2-4
+    // chased -- even though the NPU's actual matmul was numerically correct
+    // the whole time (proven via independent CPU cross-check computed from
+    // the pre-pack FP32 values, see rk3576-stage5-window-1-20260828
+    // evidence: NPU output matched a from-scratch reference to ~0.1-0.7%,
+    // consistent with FP16 rounding, not the reported 110-420% error).
+    // Fix: unpack the native tiling and dequantize back to FP32 in the
+    // tensor's original (n, k) order, then re-encode to FP16 row-major, so
+    // a caller reading this tensor back gets a faithful round-trip.
+    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
+    const auto* pipeline = config.resolve_op_support(tensor);
+
+    if (pipeline && !pipeline->use_hadamard && pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16
+        && tensor->type == GGML_TYPE_F16) {
+        const int K = (int)tensor->ne[0];
+        const int N = (int)tensor->ne[1];
+
+        int k_limit = config.max_k_limit;
+        if (pipeline->effective_k > 0) {
+            k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
+        }
+        auto k_segments = compute_k_segments(K, k_limit, pipeline->k_align);
+        auto n_segments = compute_n_segments(N, config.active_cores, pipeline->n_align);
+
+        std::vector<uint16_t> full_f16((size_t)N * K, 0);
+        const uint8_t* read_ptr = (const uint8_t*)it->second.mem->virt_addr;
+
+        for (const auto& k_seg : k_segments) {
+            for (const auto& n_seg : n_segments) {
+                if (n_seg.size_n == 0) continue;
+                size_t seg_elements = (size_t)n_seg.size_n * k_seg.size_k;
+
+                std::vector<uint16_t> unpacked(seg_elements);
+                unpack_native((uint8_t*)unpacked.data(), read_ptr,
+                               k_seg.size_k, pipeline->k_align, n_seg.size_n, pipeline->n_align, 16);
+                read_ptr += seg_elements * 2;
+
+                for (int i = 0; i < n_seg.size_n; ++i) {
+                    int global_n = n_seg.offset_n + i;
+                    if (global_n >= N) continue;
+                    memcpy(&full_f16[(size_t)global_n * K + k_seg.offset_k],
+                           &unpacked[(size_t)i * k_seg.size_k], k_seg.size_k * sizeof(uint16_t));
+                }
+            }
+        }
+
+        memcpy(data, (const uint8_t*)full_f16.data() + offset, size);
+        return;
+    }
+
+    // TODO(rk3576-stage5): the same class of bug applies to INT8/INT4
+    // (Q8_0/Q6_K/Q4_0 weight) pipelines and Hadamard pipelines -- their
+    // native packed bytes are handed back unchanged below, which is only
+    // safe because real serving never reads weights back. Fix + hardware-
+    // verify when those pipelines are next exercised by a readback-
+    // sensitive caller (e.g. test-backend-ops coverage expands past
+    // type_a=f16, or a future goal needs weight readback for those types).
+    memcpy(data, (uint8_t*)it->second.mem->virt_addr + offset, size);
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
