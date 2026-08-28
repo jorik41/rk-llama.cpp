@@ -28,6 +28,21 @@
 
 #define UNUSED(x) (void)(x)
 
+// --- RKNPU2 debug instrumentation (Stage-4 glue hunt, env-gated) ---
+// Enable with GGML_RKNPU2_DEBUG=1. Traces the buffer-integration glue:
+// tensor_allocs (per-buffer, offset-keyed) and matmul_ctx_cache (per-backend,
+// process-lifetime, keyed by addr+offset+shape) -- the two caches suspected
+// of stale-binding on address reuse (see rk3576-stage4-glue-hunt-20260828).
+static bool rknpu2_debug_enabled() {
+    static int v = -1;
+    if (v == -1) {
+        const char* e = std::getenv("GGML_RKNPU2_DEBUG");
+        v = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+#define RKNPU2_DBG(...) do { if (rknpu2_debug_enabled()) { fprintf(stderr, "[RKNPU2_DBG] " __VA_ARGS__); fflush(stderr); } } while (0)
+
 // --- IOMMU Domain Manager ---
 
 // Helper function for parsing complex integer lists
@@ -289,6 +304,8 @@ struct ggml_backend_rknpu_buffer_context {
         auto it = tensor_allocs.find(tensor_offset);
         if (it != tensor_allocs.end()) {
             if (it->second.size < size) {
+                RKNPU2_DBG("alloc RESIZE buf=%s offset=%zu old_size=%zu new_size=%zu old_fd=%d old_ptr=%p\n",
+                    name.c_str(), tensor_offset, it->second.size, size, it->second.mem->fd, it->second.mem->virt_addr);
                 rknn_matmul_ctx old_ctx = g_domain_manager.get_allocator_context(it->second.iommu_domain_id);
                 rknn_destroy_mem(old_ctx, it->second.mem);
                 g_domain_manager.release_domain_memory(it->second.iommu_domain_id, it->second.size);
@@ -297,6 +314,12 @@ struct ggml_backend_rknpu_buffer_context {
                 rknn_matmul_ctx new_ctx = g_domain_manager.get_allocator_context(it->second.iommu_domain_id);
                 it->second.mem = rknn_create_mem(new_ctx, size);
                 it->second.size = size;
+                RKNPU2_DBG("alloc RESIZE-DONE buf=%s offset=%zu new_fd=%d new_ptr=%p align64=%zu\n",
+                    name.c_str(), tensor_offset, it->second.mem->fd, it->second.mem->virt_addr,
+                    (size_t)((uintptr_t)it->second.mem->virt_addr % 64));
+            } else {
+                RKNPU2_DBG("alloc HIT buf=%s offset=%zu req_size=%zu cached_size=%zu fd=%d ptr=%p\n",
+                    name.c_str(), tensor_offset, size, it->second.size, it->second.mem->fd, it->second.mem->virt_addr);
             }
             return it->second;
         }
@@ -312,6 +335,9 @@ struct ggml_backend_rknpu_buffer_context {
         alloc.iommu_domain_id = domain_id;
 
         GGML_ASSERT(alloc.mem != nullptr && "Failed to allocate tensor memory via RKNN API");
+        RKNPU2_DBG("alloc MISS-NEW buf=%s offset=%zu size=%zu domain=%d fd=%d ptr=%p align64=%zu\n",
+            name.c_str(), tensor_offset, size, domain_id, alloc.mem->fd, alloc.mem->virt_addr,
+            (size_t)((uintptr_t)alloc.mem->virt_addr % 64));
         tensor_allocs[tensor_offset] = alloc;
 
         return alloc;
@@ -351,6 +377,14 @@ struct rknpu_matmul_context {
     }
 };
 
+// Global pointer to the single (process-lifetime) RKNPU backend instance,
+// set by ggml_backend_rknpu_device_init_backend. Used by
+// ggml_backend_rknpu_buffer_free_buffer to invalidate matmul_ctx_cache
+// entries when their backing DMA allocation is freed -- see
+// invalidate_matmul_ctx_for_address (Stage-4 fix,
+// rk3576-stage4-glue-hunt-20260828).
+static struct ggml_backend_rknpu_context* g_active_rknpu_backend_ctx = nullptr;
+
 // Backend main context
 struct ggml_backend_rknpu_context {
     std::string name;
@@ -371,8 +405,15 @@ struct ggml_backend_rknpu_context {
         auto key = std::make_tuple(tensor_id, offset, M, K, N, core_id, (int)type, (int)domain_id);
         auto it = matmul_ctx_cache.find(key);
         if (it != matmul_ctx_cache.end()) {
+            RKNPU2_DBG("matmul_ctx HIT addr=0x%lx off=%zu M=%d K=%d N=%d core=%d type=%d dom=%d b_bound=%d mem_B_ptr=%p ctx_obj=%p\n",
+                (unsigned long)tensor_id, offset, M, K, N, core_id, (int)type, domain_id,
+                it->second->b_bound ? 1 : 0,
+                (void*)(it->second->mem_B ? it->second->mem_B->virt_addr : nullptr),
+                (void*)it->second.get());
             return it->second;
         }
+        RKNPU2_DBG("matmul_ctx MISS-NEW addr=0x%lx off=%zu M=%d K=%d N=%d core=%d type=%d dom=%d\n",
+            (unsigned long)tensor_id, offset, M, K, N, core_id, (int)type, domain_id);
 
         auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type, domain_id);
         if (ctx->ctx == 0) {
@@ -394,6 +435,31 @@ struct ggml_backend_rknpu_context {
 
         matmul_ctx_cache[key] = ctx;
         return ctx;
+    }
+
+    // Stage-4 fix (rk3576-stage4-glue-hunt-20260828): matmul_ctx_cache is
+    // keyed by (address, offset, shape...) with no tensor identity. When the
+    // tensor_allocs slot backing that address is freed (buffer teardown) and
+    // the address is later reused for a DIFFERENT logical tensor with the
+    // same shape/type/domain, a stale cache entry -- possibly already
+    // b_bound=true -- would silently serve the new tensor's matmul with the
+    // OLD tensor's binding (confirmed on hardware: window-2 trace, M=3's
+    // bind reused for M=4 at the same reallocated DMA address). Evicting
+    // every entry whose key address matches a just-freed allocation restores
+    // the invariant that a cache hit only ever returns a binding made for
+    // memory that is still validly backing the same logical tensor.
+    void invalidate_matmul_ctx_for_address(void* addr) {
+        std::lock_guard<std::mutex> lock(mutex);
+        uintptr_t target = (uintptr_t)addr;
+        for (auto it = matmul_ctx_cache.begin(); it != matmul_ctx_cache.end(); ) {
+            if (std::get<0>(it->first) == target) {
+                RKNPU2_DBG("matmul_ctx INVALIDATE addr=%p (backing buffer freed) evicting ctx=%p b_bound_was=%d\n",
+                    addr, (void*)it->second.get(), it->second->b_bound ? 1 : 0);
+                it = matmul_ctx_cache.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 };
 
@@ -542,6 +608,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             tensor_virt_addr = it->second.mem->virt_addr;
             b_domain_id = it->second.iommu_domain_id;
         }
+        if (rknpu2_debug_enabled()) {
+            uint8_t* b0 = (uint8_t*)tensor_virt_addr;
+            RKNPU2_DBG("graph_compute B-src tensor=%p name=%s buf=%p offset=%zu fd=%d ptr=%p M=%d M_op=%d K=%d N=%d first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                (const void*)src0, src0->name, (void*)src0_buffer, tensor_offset_in_virtual, tensor_fd, tensor_virt_addr, M, M_op, K, N,
+                b0[0], b0[1], b0[2], b0[3], b0[4], b0[5], b0[6], b0[7]);
+        }
 
         // Cleaning the C-matrix buffer
         float* dst_data = (float*)get_tensor_real_ptr(dst);
@@ -596,6 +668,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         // Assigning B-matrix only once to reduce computation overhead
                         if (!matmul_ctx->b_bound) {
                             size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
+                            RKNPU2_DBG("B-BIND tensor=%s addr=%p off_in_dma=%zu seg_bytes=%zu matmul_ctx=%p\n",
+                                src0->name, tensor_virt_addr, offset_in_dma, segment_size_bytes, (void*)matmul_ctx.get());
 
                             rknn_tensor_mem* mem = rknn_create_mem_from_fd(
                                 matmul_ctx->ctx,
@@ -605,13 +679,40 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                 offset_in_dma
                             );
                             if (!mem) return GGML_STATUS_FAILED;
+                            if (rknpu2_debug_enabled()) {
+                                uint8_t* srcb = (uint8_t*)tensor_virt_addr + offset_in_dma;
+                                uint8_t* impb = (uint8_t*)mem->virt_addr;
+                                RKNPU2_DBG("B-IMPORTED mem=%p imp_fd=%d imp_ptr=%p imp_size=%u SRC(passed-in) src_fd=%d src_ptr=%p src_off=%zu SAME_PTR=%d src_first8=%02x%02x%02x%02x%02x%02x%02x%02x imp_first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                    (void*)mem, mem->fd, mem->virt_addr, mem->size,
+                                    tensor_fd, tensor_virt_addr, offset_in_dma,
+                                    (mem->virt_addr == (void*)((uint8_t*)tensor_virt_addr + offset_in_dma)) ? 1 : 0,
+                                    srcb[0], srcb[1], srcb[2], srcb[3], srcb[4], srcb[5], srcb[6], srcb[7],
+                                    impb[0], impb[1], impb[2], impb[3], impb[4], impb[5], impb[6], impb[7]);
+                            }
 
                             auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
                             matmul_ctx->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
 
                             RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
 
+                            // Stage-4 fix (rk3576-stage4-glue-hunt-20260828): the A-matrix
+                            // path a few lines below explicitly calls rknn_mem_sync(...,
+                            // TO_DEVICE) after writing+binding; this B-matrix path never did,
+                            // even though it imports a SEPARATE rknn_tensor_mem handle (via
+                            // rknn_create_mem_from_fd, bound to this specific matmul_ctx->ctx)
+                            // distinct from the handle buffer_set_tensor already synced
+                            // (alloc.mem, under a dummy allocator context). Confirmed on
+                            // hardware (window-2 trace): even a completely fresh, first-ever
+                            // bind (no cache staleness possible) produced garbage output;
+                            // adding the matching sync call here fixes it.
+                            RKNN_CHECK(rknn_mem_sync(matmul_ctx->ctx, matmul_ctx->mem_B.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE (matmul_ctx)");
+
                             matmul_ctx->b_bound = true;
+                        } else if (rknpu2_debug_enabled()) {
+                            uint8_t* cb = (uint8_t*)tensor_virt_addr + offset_in_dma;
+                            RKNPU2_DBG("B-SKIP(cached-bind-reused) tensor=%s addr=%p off_in_dma=%zu matmul_ctx=%p live_first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                                src0->name, tensor_virt_addr, offset_in_dma, (void*)matmul_ctx.get(),
+                                cb[0], cb[1], cb[2], cb[3], cb[4], cb[5], cb[6], cb[7]);
                         }
                         break;
                     }
@@ -710,11 +811,20 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ========== 4. Running operation ==========
             // ==========================================
             {
+                if (rknpu2_debug_enabled()) {
+                    for (size_t idx = 0; idx < num_active_segments; idx++) {
+                        auto& mc = matmul_ctxs[idx];
+                        uint8_t* rb = mc->mem_B ? (uint8_t*)mc->mem_B->virt_addr : nullptr;
+                        RKNPU2_DBG("PRE-RUN idx=%zu matmul_ctx=%p mem_B=%p mem_B_ptr=%p first8=%s\n",
+                            idx, (void*)mc.get(), mc->mem_B ? (void*)mc->mem_B.get() : nullptr, (void*)rb,
+                            rb ? [&]{ static char buf[32]; snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x%02x%02x%02x", rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7]); return (const char*)buf; }() : "(null)");
+                    }
+                }
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
                     if (ret != RKNN_SUCC) {
-                        // Handle error
+                        RKNPU2_DBG("rknn_matmul_run FAILED idx=%zu ret=%d\n", idx, ret);
                     }
                 }
             }
@@ -846,6 +956,11 @@ static void ggml_backend_rknpu_buffer_free_buffer(ggml_backend_buffer_t buffer) 
     // Freeing an every individual RKNN buffer using the allocator context
     for (auto& pair : ctx->tensor_allocs) {
         if (pair.second.mem) {
+            RKNPU2_DBG("free_buffer buf=%s offset=%zu fd=%d ptr=%p size=%zu (invalidating matmul_ctx_cache for this addr)\n",
+                ctx->name.c_str(), pair.first, pair.second.mem->fd, pair.second.mem->virt_addr, pair.second.size);
+            if (g_active_rknpu_backend_ctx) {
+                g_active_rknpu_backend_ctx->invalidate_matmul_ctx_for_address(pair.second.mem->virt_addr);
+            }
             rknn_matmul_ctx alloc_ctx = g_domain_manager.get_allocator_context(pair.second.iommu_domain_id);
             rknn_destroy_mem(alloc_ctx, pair.second.mem);
             g_domain_manager.release_domain_memory(pair.second.iommu_domain_id, pair.second.size);
@@ -873,6 +988,8 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
     if (pipeline) {
         size_t offset = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
         size_t size = get_tensor_packed_size(tensor);
+        RKNPU2_DBG("init_tensor tensor=%p name=%s buf=%s offset=%zu size=%zu\n",
+            (const void*)tensor, tensor->name, ctx->name.c_str(), offset, size);
         ctx->get_tensor_allocation(offset, size);
     }
 
@@ -1072,6 +1189,8 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     const auto* pipeline = config.resolve_op_support(tensor);
 
     size_t tensor_offset_in_virtual = (uintptr_t)tensor->data - (uintptr_t)ctx->virtual_base;
+    RKNPU2_DBG("set_tensor ENTER tensor=%p name=%s buf=%s off_virtual=%zu call_offset=%zu call_size=%zu pipeline=%s\n",
+        (const void*)tensor, tensor->name, ctx->name.c_str(), tensor_offset_in_virtual, offset, size, pipeline ? "yes" : "no");
 
     if (pipeline) {
         const int K = (int)tensor->ne[0];
@@ -1167,6 +1286,12 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
+        if (rknpu2_debug_enabled()) {
+            uint8_t* pb = (uint8_t*)alloc.mem->virt_addr;
+            RKNPU2_DBG("set_tensor DONE tensor=%p name=%s fd=%d ptr=%p first8_packed=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                (const void*)tensor, tensor->name, alloc.mem->fd, alloc.mem->virt_addr,
+                pb[0], pb[1], pb[2], pb[3], pb[4], pb[5], pb[6], pb[7]);
+        }
     } else {
         memcpy((uint8_t*)tensor->data + offset, data, size);
     }
@@ -1351,6 +1476,7 @@ static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t 
     if (!rknpu2_configuration::Rknpu2ConfigManager::get_instance().select_device(target_device)) return NULL;
 
     ggml_backend_rknpu_context * ctx = new ggml_backend_rknpu_context();
+    g_active_rknpu_backend_ctx = ctx;
 
     static const struct ggml_backend_i rknpu_backend_interface = {
         /* .get_name           = */ ggml_backend_rknpu_name,

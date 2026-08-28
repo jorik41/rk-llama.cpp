@@ -215,10 +215,124 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
 
     device_configs["RK3588"] = rk3588_config;
 
-    // --- Define RK3576 Configuration (Placeholder) ---
-    // Rknpu2DeviceConfig rk3576_config;
-    // ... fill config for RK3576 ...
-    // device_configs["RK3576"] = rk3576_config;
+    // --- Define RK3576 Configuration ---
+    // JUSTICE R&D DRAFT 2026-08-28 (rk3576-backend-contrib-20260828).
+    // Evidence for every field is recorded in the accompanying R&D report:
+    //   - active_cores={0,1} (2 cores): SDK rknn_core_mask semantics (RK3576
+    //     never exposes RKNN_NPU_CORE_2), independently corroborated by public
+    //     RK3576 NPU specs (dual-core, 6 TOPS combined) and by our own
+    //     rkllm-toolkit conversion flag num_npu_core=2 for this exact board.
+    //   - max_k_limit=4096: DIRECTLY documented in the installed SDK header
+    //     (rknn_matmul_api.h, librknnrt 2.3.0): "for RK3576: when K > 4096,
+    //     the B data will be split into T segments" (vs RK3588's K>8192).
+    //     Strongest evidence tier (SDK header constant, board-verified).
+    //   - k_align=32 (all types), and the W16A16 n_align=16: header's general
+    //     "RK3588/3576" K/N alignment table (same generation NPU IP).
+    //   - The W8A8/W4A4 (symmetric INT8xINT8 / INT4xINT4) pipelines used by
+    //     RK3588 are INTENTIONALLY OMITTED here: the upstream maintainer
+    //     (invisiofficial, PR #13 review thread, 2026-05-15) states RK3576
+    //     does not support W4A4 and recommends W8A16 over W8A8 (RK3576-only,
+    //     faster+more accurate, both require FP16 activation MACs) -- this
+    //     is corroborated by the official RK3576 spec describing the NPU as
+    //     supporting "INT4/INT8/INT16/FP16/BF16/TF32 MIXED operation" (not
+    //     symmetric low-bit x low-bit like RK3588). W8A16/W4A16 = FP16
+    //     activation (npu_type_a) x INT8/INT4 weight (npu_type_b).
+    //   - W8A16/W4A16 n_align=16 (not the header's general int8-type 32 /
+    //     int4-type 64): this is the maintainer's OWN board-tested value
+    //     (nanopi-M5 RK3576, same board class as ours) for this specific
+    //     mixed-precision pipeline, which the generic SDK doc table does not
+    //     explicitly cover (that table documents same-type A/B pairs).
+    //     MARKED EXPERIMENTAL below -- see report Task 5 for the settling
+    //     test (rknn_matmul_create + query real B tensor native-layout dims
+    //     for RKNN_FLOAT16_MM_INT8_TO_FLOAT32 / ..._INT4_TO_FLOAT32 on this
+    //     exact board, off the serving path).
+    Rknpu2DeviceConfig rk3576_config;
+    rk3576_config.device_name = "RK3576";
+    rk3576_config.active_cores = custom_cores.empty() ? std::vector<int>{0, 1} : custom_cores;
+    rk3576_config.max_k_limit = 4096;
+    rk3576_config.hardware_pipelines = {
+        {
+            /* .pipeline_name = */ "W16A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_FP16,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W16A16_HADAMARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_FP16,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ true
+        },
+        {
+            // EXPERIMENTAL: n_align=16 per maintainer's own RK3576 board
+            // testing (PR #13 thread); generic header int8-type rule (32)
+            // may not apply to this FP16-activation x INT8-weight mixed op.
+            /* .pipeline_name = */ "W8A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W8A16_HADAMARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ true
+        },
+        {
+            // EXPERIMENTAL: n_align=16 (see W8A16_STANDARD note above);
+            // generic header int4-type rule would suggest 64.
+            /* .pipeline_name = */ "W4A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT4_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
+        },
+        {
+            /* .pipeline_name = */ "W4A16_HADAMARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT4,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT4_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ true
+        }
+    };
+
+    rk3576_config.use_custom_pattern = use_custom_pattern;
+    rk3576_config.custom_hybrid_pattern = custom_pattern;
+
+    rk3576_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
+    rk3576_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A16_STANDARD"};
+    rk3576_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A16_STANDARD", "W4A16_HADAMARD"};
+    rk3576_config.default_patterns[(int)GGML_TYPE_Q4_0] = {"W4A16_HADAMARD"};
+
+    device_configs["RK3576"] = rk3576_config;
 
     // --- Define RK3566 Configuration (Placeholder) ---
     // Rknpu2DeviceConfig rk3566_config;
