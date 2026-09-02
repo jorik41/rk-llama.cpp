@@ -7991,6 +7991,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // npu_fix7_20260902: RK3588/RK3576 RKNPU2 backend MUL_MAT shapes actually
+    // exercised by qwen2.5-1.5b-instruct-q8_0 serving (embd=1536, ff=8960,
+    // vocab=151936), which the m=16 default cases above never reach -- the
+    // RKNPU2 device_supports N-alignment gate (ggml-rknpu2.cpp: src0->ne[1] %
+    // pipeline->n_align != 0) declines every m=16 case for q8_0 (n_align=32)
+    // and f16 (n_align=16 -> 16%16==0 actually passes for f16, kept anyway
+    // for a direct q8_0-vs-f16 comparison at identical (n,k)). These add
+    // real coverage of the W8A8_STANDARD (q8_0 weight) and W16A16_STANDARD
+    // (f16 attention) pipelines at the exact N/K pairs and M (batch/token
+    // count) values serving uses: attn/o-proj (1536x1536), gate/up-proj
+    // (8960x1536), down-proj (1536x8960), lm_head (151936x1536). See
+    // npu_fix7_serving_correctness_20260902.md for the NMSE tolerance
+    // discussion and the +31.6% PPL gap this targets. m=151936,n=512 is
+    // skipped for both types (~250-470MB A/weight buffer plus reference
+    // copies per case) to keep this block's memory footprint bounded.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (auto nk : {std::pair<int64_t,int64_t>{1536, 1536},
+                         std::pair<int64_t,int64_t>{8960, 1536},
+                         std::pair<int64_t,int64_t>{1536, 8960},
+                         std::pair<int64_t,int64_t>{151936, 1536}}) {
+            const int64_t n_dim = nk.first;
+            const int64_t k_dim = nk.second;
+            for (int64_t m_tok : {1, 8, 512}) {
+                if (n_dim == 151936 && m_tok == 512) {
+                    continue;
+                }
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, n_dim, m_tok, k_dim, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
 #if 0
     {
         // Test paths in OpenCL
