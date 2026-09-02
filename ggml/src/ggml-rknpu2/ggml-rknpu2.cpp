@@ -95,6 +95,23 @@ static bool rknpu2_device_disabled() {
     return v == 1;
 }
 
+// rknpu2-broadcast-mulmat-20260902 (fix #6): minimum per-slice M (== the
+// MUL_MAT's src1->ne[1], i.e. token/row count) below which we decline a
+// *broadcast* MUL_MAT (GQA-style K/V-repeat: src0's ne[2]/ne[3] < src1's)
+// rather than looping the NPU over each of the r2*r3 head/batch slices.
+// Each slice is a separate rknn_matmul_run()+rknn_mem_sync() round trip;
+// the B-matrix (src0 slice) bind is cached and reused across the r2/r3
+// repeats of the same slice (see matmul_ctx_cache, keyed by
+// address+offset -- broadcast reuse is "free" there), but the A-matrix
+// upload, the run itself, and the C readback still happen once per
+// slice. At decode time (M==1) that per-call dispatch overhead dominates
+// the tiny actual compute and is expected to lose to ggml-cpu's fused
+// attention kernel; at prefill-sized M the per-call NPU compute is large
+// enough to amortize it. 32 is a first-draft threshold, not yet
+// board-measured -- see npu_fix6_broadcast_20260902.md secs 4-5 for the
+// reasoning and the bench-driven follow-up to tune (or make config-driven).
+static constexpr int64_t RKNPU2_BROADCAST_MIN_M = 32;
+
 // --- IOMMU Domain Manager ---
 
 // Helper function for parsing complex integer lists
@@ -794,23 +811,43 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
         struct ggml_tensor* dst = node;
 
-        // rknpu2-broadcast-decline-20260902 (mirrors the check added to
-        // ggml_backend_rknpu_device_supports_op() below). This function
-        // derives M purely from src1->ne[1] and never reads nb[2]/nb[3]
-        // anywhere below -- it has zero handling for a batch dimension on
-        // ANY operand. supports_op() is meant to keep such nodes out of
-        // this backend's split entirely, but the two gates are known to be
-        // able to disagree (see MASTERPORT_FIX_REDIAGNOSIS_20260828.md sec
-        // 0/2, where resolve_op_support() and supports_op() diverging on
-        // the same tensor was the root cause of a prior regression) -- so
-        // re-check here rather than trust the caller. continue leaves this
-        // node unexecuted, matching every other decline path in this loop
-        // (zero-dimension, missing pipeline, empty segments).
-        if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
-            src1->ne[2] != 1 || src1->ne[3] != 1 ||
-            dst->ne[2]  != 1 || dst->ne[3]  != 1) {
-            continue;
+        // rknpu2-broadcast-mulmat-20260902 (fix #6, mirrors the check added
+        // to ggml_backend_rknpu_device_supports_op() below -- see its
+        // comment for the full rationale). This re-derives the same
+        // has_batch / integer-ratio / M-threshold decision supports_op
+        // already made, in case the two gates disagree (see
+        // MASTERPORT_FIX_REDIAGNOSIS_20260828.md sec 0/2, where exactly
+        // that divergence was the root cause of a prior regression) --
+        // trust nothing from the caller. `continue` leaves this node
+        // unexecuted, matching every other decline path in this loop
+        // (zero-dimension, missing pipeline, empty segments); unlike
+        // those, a decline HERE after supports_op already accepted the
+        // node would silently leave dst un-written (ggml already routed
+        // this node to this backend), so this check's accept/decline set
+        // must stay in lockstep with supports_op's -- both are re-checked
+        // against the same RKNPU2_BROADCAST_MIN_M and pipeline->npu_type_b
+        // conditions below, after `pipeline` is resolved.
+        const bool has_batch = (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+                                 src1->ne[2] != 1 || src1->ne[3] != 1 ||
+                                 dst->ne[2]  != 1 || dst->ne[3]  != 1);
+        if (has_batch) {
+            if (dst->ne[2] != src1->ne[2] || dst->ne[3] != src1->ne[3] ||
+                src0->ne[2] > src1->ne[2] || src0->ne[3] > src1->ne[3] ||
+                src1->ne[2] % src0->ne[2] != 0 ||
+                src1->ne[3] % src0->ne[3] != 0 ||
+                src1->ne[1] < RKNPU2_BROADCAST_MIN_M) {
+                continue;
+            }
         }
+        // Broadcast loop bounds: for a plain 2D MUL_MAT these are all 1,
+        // so the (i3,i2) loop added below runs its body exactly once --
+        // byte-for-byte the pre-fix-6 control flow. r2/r3 are GGML's own
+        // MUL_MAT broadcast ratios (mirrors ggml-cpu's
+        // ggml_compute_forward_mul_mat: r2 = ne12/ne02, r3 = ne13/ne03);
+        // i02 = i2/r2, i03 = i3/r3 pick which src0 slice a given
+        // src1/dst slice broadcasts against.
+        const int64_t ne12 = src1->ne[2], ne13 = src1->ne[3];
+        const int64_t r2 = ne12 / src0->ne[2], r3 = ne13 / src0->ne[3];
 
         const int M = (int)src1->ne[1];
         const int K = (int)src0->ne[0];
@@ -829,6 +866,19 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         const auto* pipeline = config.resolve_op_support(src0);
         if (!pipeline) continue;
+
+        // rknpu2-broadcast-mulmat-20260902 (fix #6): mirrors the identical
+        // FP16-only / non-Hadamard scope-limit gate in
+        // ggml_backend_rknpu_device_supports_op() below -- see its comment
+        // for the full rationale (INT8/INT4 per-slice dequant-scale
+        // indexing is not yet extended for a batched src0). Must stay in
+        // lockstep with that gate's decision (see the note on has_batch
+        // above) -- if this ever disagreed with supports_op, a node
+        // supports_op accepted would silently reach here and get declined,
+        // leaving dst un-written instead of computed.
+        if (has_batch && (pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16 || pipeline->use_hadamard)) {
+            continue;
+        }
 
         // Initializing Hadamard Transform Logic
         const bool is_hadamard = (pipeline->use_hadamard);
@@ -852,13 +902,53 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         if (active_n_segments.empty()) continue;
 
+        // rknpu2-broadcast-mulmat-20260902 (fix #6): the per-(K,N)-slice
+        // packed size, i.e. what get_tensor_packed_size() (this file)
+        // computes for ONE slice before its own ne[2]*ne[3] multiply.
+        // FP16-only per the scope gate above (type_size_packed==2); needed
+        // to locate each src0 slice's own region within the buffer
+        // ggml_backend_rknpu_buffer_set_tensor()'s matching per-slice loop
+        // packed back-to-back (i3-major, i2-minor over src0's OWN
+        // ne[2]/ne[3] -- see slice_linear_index below).
+        size_t per_slice_packed_size = 0;
+        for (const auto& k_seg : all_k_segments) {
+            for (const auto& n_seg : active_n_segments) {
+                per_slice_packed_size += (size_t)n_seg.size_n * k_seg.size_k * 2;
+            }
+        }
+
+        // Cleaning the whole C-matrix (dst) buffer once, up front -- the
+        // (i3,i2) loop below writes disjoint M*N slices of it, each zeroed
+        // exactly once here rather than per-slice.
+        uint8_t* dst_data_base = (uint8_t*)get_tensor_real_ptr(dst);
+        memset(dst_data_base, 0, ggml_nbytes(dst));
+
+        // rknpu2-broadcast-mulmat-20260902 (fix #6): one NPU matmul per
+        // (i3,i2) slice of src1/dst's batch shape. For a plain 2D MUL_MAT
+        // ne12==ne13==1 so this runs its body exactly once with i2=i3=0,
+        // identical to the pre-fix-6 control flow. i02/i03 pick which
+        // (smaller, or equal) src0 slice this src1/dst slice broadcasts
+        // against; slice_linear_index addresses that slice's packed
+        // region within the shared B-matrix buffer (see
+        // per_slice_packed_size above).
+        for (int64_t i3 = 0; i3 < ne13; ++i3) {
+        for (int64_t i2 = 0; i2 < ne12; ++i2) {
+        const int64_t i02 = i2 / r2;
+        const int64_t i03 = i3 / r3;
+        const int64_t slice_linear_index = i03 * src0->ne[2] + i02;
+
         // Initializing variables
         const size_t num_active_segments = active_n_segments.size();
         std::vector<std::shared_ptr<rknpu_matmul_context>> matmul_ctxs(num_active_segments);
         std::shared_ptr<rknn_tensor_mem> mem_A_shared;
         std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments(num_active_segments);
 
-        // Acquiring the B-matrix buffer
+        // Acquiring the B-matrix buffer. NOTE: this tensor_allocs lookup is
+        // keyed by src0's own (whole-tensor) offset -- unaffected by which
+        // (i02,i03) slice we're on -- so it is invariant across the i3/i2
+        // loop and, strictly, could be hoisted above it; left inside for a
+        // smaller first-draft diff (one extra mutex-guarded map lookup per
+        // slice, cheap relative to the matmul itself).
         ggml_backend_buffer_t src0_buffer = src0->buffer;
         auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
         size_t tensor_offset_in_virtual = (uintptr_t)src0->data - (uintptr_t)src0_buf_ctx->virtual_base;
@@ -894,14 +984,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         }
         if (rknpu2_debug_enabled()) {
             uint8_t* b0 = (uint8_t*)tensor_virt_addr;
-            RKNPU2_DBG("graph_compute B-src tensor=%p name=%s buf=%p offset=%zu fd=%d ptr=%p M=%d M_op=%d K=%d N=%d first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+            RKNPU2_DBG("graph_compute B-src tensor=%p name=%s buf=%p offset=%zu fd=%d ptr=%p M=%d M_op=%d K=%d N=%d i2=%lld i3=%lld i02=%lld i03=%lld first8=%02x%02x%02x%02x%02x%02x%02x%02x\n",
                 (const void*)src0, src0->name, (void*)src0_buffer, tensor_offset_in_virtual, tensor_fd, tensor_virt_addr, M, M_op, K, N,
+                (long long)i2, (long long)i3, (long long)i02, (long long)i03,
                 b0[0], b0[1], b0[2], b0[3], b0[4], b0[5], b0[6], b0[7]);
         }
 
-        // Cleaning the C-matrix buffer
-        float* dst_data = (float*)get_tensor_real_ptr(dst);
-        memset(dst_data, 0, (size_t)M * N * sizeof(float));
+        // This slice's region of the C-matrix (dst) buffer -- already
+        // zeroed in bulk above.
+        float* dst_data = (float*)(dst_data_base + i2 * dst->nb[2] + i3 * dst->nb[3]);
 
         // Acquiring the Hadamard vector
         std::vector<float> s_vec;
@@ -926,8 +1017,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
         else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
 
-        // Computing K dimensions segments
-        size_t current_offset_in_tensor = 0;
+        // Computing K dimensions segments. rknpu2-broadcast-mulmat-20260902
+        // (fix #6): starts at this slice's own base offset within the
+        // shared packed buffer (0 for the common non-batch case, where
+        // slice_linear_index is always 0) instead of always 0.
+        size_t current_offset_in_tensor = slice_linear_index * per_slice_packed_size;
         for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
             const auto& k_seg = all_k_segments[k_idx];
             const int K_seg_op = k_seg.size_k;
@@ -1019,7 +1113,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 mem_A_shared = get_tensor_buffer(backend_ctx, matmul_ctx_0, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
                 if (!mem_A_shared) return GGML_STATUS_FAILED;
 
-                const float* x = (const float*)get_tensor_real_ptr(src1);
+                // rknpu2-broadcast-mulmat-20260902 (fix #6): this slice's
+                // region of src1 -- get_tensor_real_ptr(src1) is the base
+                // (src1 is never a "pipeline" tensor here -- see the
+                // is_contiguous() check in supports_op -- so this is a
+                // plain nb[2]/nb[3]-strided byte offset into src1's own
+                // ggml-format buffer, not a packed-buffer lookup).
+                const float* x = (const float*)((const uint8_t*)get_tensor_real_ptr(src1) + i2 * src1->nb[2] + i3 * src1->nb[3]);
                 const int row_stride = (int)(src1->nb[1] / sizeof(float));
                 void* dst_base = mem_A_shared->virt_addr;
 
@@ -1232,6 +1332,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
         }
+        } // i2 (rknpu2-broadcast-mulmat-20260902, fix #6)
+        } // i3 (rknpu2-broadcast-mulmat-20260902, fix #6)
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1275,7 +1377,15 @@ static size_t get_tensor_packed_size(const struct ggml_tensor * tensor) {
                 }
             }
         }
-        return total_size;
+
+        // rknpu2-broadcast-mulmat-20260902 (fix #6): total_size above is the
+        // packed size of ONE logical (K,N) 2D slice. A tensor that can be the
+        // src0 (weight/"B") side of a GQA-broadcast MUL_MAT (ne[2]/ne[3] > 1,
+        // e.g. a per-head-kv-group K/V cache slab) needs ne[2]*ne[3] such
+        // slices packed back-to-back -- see the matching per-slice loop this
+        // fix adds to ggml_backend_rknpu_buffer_set_tensor() below. Ordinary
+        // 2D weight tensors have ne[2]==ne[3]==1, so this is a no-op for them.
+        return total_size * (size_t)tensor->ne[2] * (size_t)tensor->ne[3];
     }
     return ggml_nbytes(tensor);
 }
@@ -1673,6 +1783,33 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
         std::vector<float> row_scales;
 
+        // rknpu2-broadcast-mulmat-20260902 (fix #6): a tensor eligible to be
+        // the src0/"B" side of a GQA-broadcast MUL_MAT carries ne[2]/ne[3] >
+        // 1 (e.g. one packed slice per K/V head-kv-group). Loop the existing
+        // per-2D-slice segment-packing logic below over every (i3,i2) slice,
+        // packing them back-to-back into the buffer sized by the matching
+        // ne[2]*ne[3] multiply this fix adds to get_tensor_packed_size()
+        // above. i3-major, i2-minor order to match the slice_linear_index =
+        // i03*ne[2]+i02 addressing ggml_backend_rknpu_graph_compute() (this
+        // file) uses to find a given slice's B-matrix offset. Ordinary 2D
+        // weight tensors (ne[2]==ne[3]==1) run this loop exactly once, byte
+        // for byte identical to before this fix -- `slice_raw_data == data`.
+        // NOTE (scope): this only re-derives each slice's *row data*
+        // (dequantize_row indexes `raw_data` as a flat contiguous (N,K)
+        // block per tensor->nb[2]/nb[3] strides, which requires `tensor` to
+        // be contiguous -- already required by supports_op's
+        // ggml_is_contiguous() check on the graph_compute side). It does
+        // NOT extend `offset`/`size` partial-write handling: like the
+        // pre-fix-6 code, this assumes a single full-tensor write
+        // (offset==0, size==ggml_nbytes(tensor)), true for how llama.cpp
+        // populates NPU-resident weights and (per current evidence) also
+        // true for how K/V-cache tensors reach this backend; a future
+        // incremental (row-at-a-time) KV-cache write path through this
+        // buffer type would need separate handling, out of scope here.
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+        const void* slice_raw_data = (const uint8_t*)data + i3 * tensor->nb[3] + i2 * tensor->nb[2];
+
         // Processing individual segments block-by-block
         for (size_t k_idx = 0; k_idx < k_segments.size(); ++k_idx) {
             const auto& k_seg = k_segments[k_idx];
@@ -1680,11 +1817,14 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 if (n_seg.size_n == 0) continue;
 
                 // Dequantizing the block
-                dequantize_tensor_segment(seg_fp32, tensor, ctx, data, K, N, K_op, k_seg, n_seg, pipeline->use_hadamard);
+                dequantize_tensor_segment(seg_fp32, tensor, ctx, slice_raw_data, K, N, K_op, k_seg, n_seg, pipeline->use_hadamard);
 
                 // Stage-5 debug: stash this block's FP32 values into a full
                 // N x K side-buffer keyed by tensor pointer, for graph_compute's
                 // independent CPU cross-check (see g_debug_weight_fp32 above).
+                // Not extended per-slice (diagnostic-only): for a batched
+                // tensor this ends up holding only the LAST (i3,i2) slice
+                // visited.
                 if (rknpu2_debug_enabled() && !pipeline->use_hadamard) {
                     std::lock_guard<std::mutex> dbg_lock(g_debug_weight_mutex);
                     auto& dbuf = g_debug_weight_fp32[tensor];
@@ -1732,6 +1872,8 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 current_write_ptr += bytes_written;
             }
         }
+        } // i2
+        } // i3
 
         {
             std::lock_guard<std::mutex> lock(ctx->mutex);
@@ -1837,22 +1979,29 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         auto k_segments = compute_k_segments(K, k_limit, pipeline->k_align);
         auto n_segments = compute_n_segments(N, config.active_cores, pipeline->n_align);
 
-        // rk3588-get-tensor-readback-size-20260902: the unpack loop below only
-        // ever fills the first N*K elements (a single 2D (K,N) slice -- the shape
-        // this fast unpack path was proven correct for, see the Stage-5 comment
-        // above). But the caller-supplied `size` (== ggml_nbytes(tensor) for the
-        // common offset=0 full-tensor read, ggml-backend.cpp:401/408) counts ALL
-        // GGML_MAX_DIMS via tensor->nb[] strides, so for a tensor with ne[2] and/or
-        // ne[3] > 1 (e.g. a batched MUL_MAT operand) `size` can be a multiple of
-        // N*K*sizeof(uint16_t) -- ASAN caught the final memcpy below reading past
-        // an 8192-byte allocation for a 24576-byte request (ne[2]==3). Size the
-        // staging allocation from the same expression the final memcpy uses so the
-        // read is always in-bounds; the leading N*K elements stay the proven exact
-        // 2D readback, any elements beyond that (uncovered >2D case) stay
-        // zero-initialized rather than reading out of bounds.
+        // rk3588-get-tensor-readback-size-20260902 + rknpu2-broadcast-
+        // mulmat-20260902 (fix #6): the unpack loop below now walks every
+        // (i3,i2) slice of a batched (ne[2]/ne[3] > 1) tensor -- e.g. a
+        // per-head-kv-group K/V cache slab -- in the same i3-major,
+        // i2-minor order ggml_backend_rknpu_buffer_set_tensor() packed them
+        // in (see its matching fix-6 loop above), instead of only ever
+        // filling the first N*K elements and leaving the rest zeroed. The
+        // caller-supplied `size` (== ggml_nbytes(tensor) for the common
+        // offset=0 full-tensor read, ggml-backend.cpp:401/408) already
+        // counts every GGML_MAX_DIMS via tensor->nb[] strides, so sizing
+        // the staging allocation from the same expression the final memcpy
+        // uses (as before this fix) is already big enough for the full
+        // ne[2]*ne[3] batch -- this fix only changes whether it gets
+        // filled correctly instead of zero-padded past slice 0.
         const size_t full_elems = std::max<size_t>((size_t)N * K, (offset + size + sizeof(uint16_t) - 1) / sizeof(uint16_t));
         std::vector<uint16_t> full_f16(full_elems, 0);
         const uint8_t* read_ptr = (const uint8_t*)it->second.mem->virt_addr;
+        const int64_t ne2 = tensor->ne[2], ne3 = tensor->ne[3];
+
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+        const size_t slice_elem_base = ((size_t)i3 * ne2 + (size_t)i2) * (size_t)N * K;
+        if (slice_elem_base >= full_elems) continue; // defensive; should not happen, full_elems covers ne2*ne3*N*K
 
         for (const auto& k_seg : k_segments) {
             for (const auto& n_seg : n_segments) {
@@ -1867,11 +2016,13 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
                 for (int i = 0; i < n_seg.size_n; ++i) {
                     int global_n = n_seg.offset_n + i;
                     if (global_n >= N) continue;
-                    memcpy(&full_f16[(size_t)global_n * K + k_seg.offset_k],
+                    memcpy(&full_f16[slice_elem_base + (size_t)global_n * K + k_seg.offset_k],
                            &unpacked[(size_t)i * k_seg.size_k], k_seg.size_k * sizeof(uint16_t));
                 }
             }
         }
+        } // i2
+        } // i3
 
         memcpy(data, (const uint8_t*)full_f16.data() + offset, size);
         return;
@@ -2140,33 +2291,66 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
-            // rknpu2-broadcast-decline-20260902 (see companion check in
-            // ggml_backend_rknpu_graph_compute() above). Stage-1 buffer
-            // guard (resolve_op_support, rknpu2-configuration.cpp) only
-            // sees the weight tensor and is blind to GGML's MUL_MAT
-            // broadcast form: a 2-D weight (ne[2]==ne[3]==1) reused
-            // against a batched *activation* tensor (src1/op with ne[2]>1
-            // or ne[3]>1 -- e.g. test-backend-ops bs=[1,1],nr=[4,1], and
-            // real multi-sequence parallel decode). op's ne[2]/ne[3]
-            // mirror src1's for MUL_MAT (dst inherits src1's batch
-            // shape), so checking op here also covers dst at the
-            // graph_compute call site. ggml_backend_rknpu_graph_compute()
-            // (this file, ~line 725) has no i2/i3 loop and no use of
-            // nb[2]/nb[3] anywhere -- it can only correctly execute a
-            // MUL_MAT where every operand is logically 2-D. Decline
-            // (route to CPU) whenever ANY operand carries a batch
-            // dimension, regardless of which operand it lives on. This is
-            // a clean-refusal guard only -- no broadcast compute support
-            // is added.
-            if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
-                src1->ne[2] != 1 || src1->ne[3] != 1 ||
-                op->ne[2]   != 1 || op->ne[3]   != 1) {
-                return false;
+            // rknpu2-broadcast-mulmat-20260902 (fix #6, see companion loop
+            // in ggml_backend_rknpu_graph_compute() above/below). Prior to
+            // this, any operand carrying a batch dim (ne[2]/ne[3] != 1)
+            // was unconditionally declined here (rknpu2-broadcast-decline-
+            // 20260902, fix #3) because graph_compute() had no i2/i3 loop
+            // and could only execute a logically-2D MUL_MAT. graph_compute
+            // now loops src0's ne[2]/ne[3]-broadcast form (the GQA K/V-
+            // repeat pattern: src0 has fewer head/batch slices than
+            // src1/op, each src0 slice reused r2=ne12/ne02,
+            // r3=ne13/ne03 times) one NPU matmul per (i3,i2) slice. GGML's
+            // own MUL_MAT broadcast contract (ggml_can_mul_mat, asserted
+            // at graph-build time) guarantees src1/op's batch dims are
+            // exact multiples of src0's whenever this op reached us with
+            // src0->ne[2]<src1->ne[2] or src0->ne[3]<src1->ne[3] -- but we
+            // still only accept the exact shape graph_compute's loop
+            // handles (src0 <= src1/op batch dims, integer ratio, op
+            // matches src1) and additionally gate on M (src1->ne[1]) so
+            // small-M (decode) broadcasts still decline to CPU -- see
+            // RKNPU2_BROADCAST_MIN_M above and the design doc's overhead
+            // analysis (per-slice dispatch cost is not worth it at M==1).
+            // A *non*-broadcast batch mismatch (src0 batch dims larger
+            // than src1's, or a non-integer ratio, or op not matching
+            // src1) is not a shape GGML's own MUL_MAT contract produces,
+            // but we still decline it defensively rather than assume.
+            const bool has_batch = (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+                                     src1->ne[2] != 1 || src1->ne[3] != 1 ||
+                                     op->ne[2]   != 1 || op->ne[3]   != 1);
+            if (has_batch) {
+                if (op->ne[2] != src1->ne[2] || op->ne[3] != src1->ne[3] ||
+                    src0->ne[2] > src1->ne[2] || src0->ne[3] > src1->ne[3] ||
+                    src1->ne[2] % src0->ne[2] != 0 ||
+                    src1->ne[3] % src0->ne[3] != 0 ||
+                    src1->ne[1] < RKNPU2_BROADCAST_MIN_M) {
+                    return false;
+                }
             }
 
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
             if (!pipeline) {
+                return false;
+            }
+
+            // rknpu2-broadcast-mulmat-20260902 (fix #6, scope limit): the
+            // per-slice buffer-layer fix (get_tensor_packed_size /
+            // buffer_set_tensor / buffer_get_tensor, this file) packs each
+            // (i3,i2) slice back-to-back but does NOT extend the INT8/INT4
+            // per-block `quantized_tensor_scales` indexing (graph_compute's
+            // `scales_B_grid[k_idx * num_active_segments + idx]`) to add a
+            // per-slice offset, so an INT8/INT4-weight broadcast MUL_MAT
+            // would read another slice's dequant scale -- wrong numbers,
+            // not a crash. Restrict this fix's broadcast support to the
+            // FP16 weight pipeline (the one covering all 24 target FAIL
+            // cases in npu_fix3_plan_20260902.md sec 1 / npu_fix6_
+            // broadcast_20260902.md) until INT8/INT4 broadcast scale
+            // indexing is extended and separately validated. Hadamard
+            // pipelines are excluded on the same "not yet extended,
+            // decline rather than assume" basis, though in practice this
+            // backend only uses Hadamard for INT4/INT8, never FP16.
+            if (has_batch && (pipeline->npu_type_b != rknpu2_configuration::NPU_TYPE_FP16 || pipeline->use_hadamard)) {
                 return false;
             }
 
