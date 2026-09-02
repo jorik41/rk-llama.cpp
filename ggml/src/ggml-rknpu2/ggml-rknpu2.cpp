@@ -28,6 +28,7 @@
 #include <cerrno>
 #include <sstream>
 #include <cmath>
+#include <cctype>
 
 #define UNUSED(x) (void)(x)
 
@@ -45,6 +46,54 @@ static bool rknpu2_debug_enabled() {
     return v == 1;
 }
 #define RKNPU2_DBG(...) do { if (rknpu2_debug_enabled()) { fprintf(stderr, "[RKNPU2_DBG] " __VA_ARGS__); fflush(stderr); } } while (0)
+
+// npu_fix5b_keep_host_weights_20260902: test/diagnosis-only opt-in. When
+// set, set_tensor() additionally stashes a verbatim copy of the host-side
+// bytes it was called with for every NPU-quantized weight tensor, and
+// get_tensor() returns that verbatim copy instead of reconstructing the
+// weight from the chip-native quantized/Hadamard-transformed layout. Unset
+// by default -- real serving never reads weights back, so the stash is
+// simply never populated and this costs nothing.
+static bool rknpu2_keep_host_weights_enabled() {
+    static int v = -1;
+    if (v == -1) {
+        const char* e = std::getenv("GGML_RKNPU_KEEP_HOST_WEIGHTS");
+        v = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// npu_fix5b_disable_device_20260902: test/diagnosis-only opt-in to make the
+// RKNPU backend register zero devices, so it never appears in
+// ggml_backend_dev_count()/ggml_backend_dev_get() enumeration and no model
+// tensor can be placed on it -- a real CPU-only run, unlike `-ngl 0`/
+// `-dev none`, which only prune GPU-type offload devices and do not affect
+// this backend's ACCEL-type device (ggml_backend_rknpu_device_get_type()
+// returns GGML_BACKEND_DEVICE_TYPE_ACCEL, which llama.cpp's `-dev`/`-ngl`
+// device-list filtering does not gate -- confirmed by fix5_ppl_cpu_v1/v2
+// still allocating a full "RKNPU model buffer" with both flags passed).
+// Reuses RKNPU_DEVICE="none" (already-read env var, see
+// ggml_backend_rknpu_device_init_backend below) as an alternate spelling so
+// a single env var can express "no RKNPU device" end to end; adds a
+// dedicated GGML_RKNPU_DISABLE for callers that would rather not overload
+// RKNPU_DEVICE's existing "pick a chip variant" meaning.
+static bool rknpu2_device_disabled() {
+    static int v = -1;
+    if (v == -1) {
+        const char* dis = std::getenv("GGML_RKNPU_DISABLE");
+        bool disabled = (dis != nullptr && dis[0] != '\0' && dis[0] != '0');
+        if (!disabled) {
+            const char* dev = std::getenv("RKNPU_DEVICE");
+            if (dev != nullptr) {
+                std::string s(dev);
+                for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+                disabled = (s == "none" || s == "off" || s == "disable" || s == "disabled");
+            }
+        }
+        v = disabled ? 1 : 0;
+    }
+    return v == 1;
+}
 
 // --- IOMMU Domain Manager ---
 
@@ -367,6 +416,21 @@ struct ggml_backend_rknpu_buffer_context {
 
     // Per-tensor random sign vector for Hadamard Transform
     std::unordered_map<const struct ggml_tensor *, std::vector<float>> hadamard_s_vectors;
+
+    // npu_fix5b_keep_host_weights_20260902: verbatim copy of the host-side
+    // bytes set_tensor() was called with for a "pipeline" (NPU-quantized)
+    // weight tensor, keyed by tensor pointer. Only populated when
+    // GGML_RKNPU_KEEP_HOST_WEIGHTS=1 (see rknpu2_keep_host_weights_enabled()
+    // below) -- unset by default, so this costs real serving nothing.
+    // Exists so a readback-sensitive caller (test-backend-ops MODE_TEST
+    // building its CPU reference via get_tensor()) can compare the NPU's
+    // compute output against the ORIGINAL un-requantized weights instead of
+    // a dequant->inverse-Hadamard->ggml_quantize_chunk() reconstruction
+    // (see npu_fix5_q4_0_nan_20260902.md / npu_fix5b_plan_20260902.md for
+    // why that reconstruction is itself a second, independent quantization
+    // step and inflates the measured error beyond genuine NPU compute
+    // error).
+    std::unordered_map<const struct ggml_tensor *, std::vector<uint8_t>> host_weight_bytes;
 
     std::mutex mutex;
 
@@ -1523,6 +1587,30 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         (const void*)tensor, tensor->name, ctx->name.c_str(), tensor_offset_in_virtual, offset, size, pipeline ? "yes" : "no");
 
     if (pipeline) {
+        // npu_fix5b_keep_host_weights_20260902: stash the verbatim host
+        // bytes (this tensor's real GGUF block-format encoding, e.g. actual
+        // per-32-element q4_0 blocks) before anything below quantizes/packs
+        // them into the chip-native layout. Test/diagnosis-only, env-gated,
+        // no cost when unset. May be called multiple times for the same
+        // tensor at different `offset` (chunked upload) -- accumulate into
+        // one ggml_nbytes(tensor)-sized buffer keyed by tensor pointer.
+        if (rknpu2_keep_host_weights_enabled()) {
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            auto& stash = ctx->host_weight_bytes[tensor];
+            const size_t total = ggml_nbytes(tensor);
+            if (stash.size() != total) stash.assign(total, 0);
+            if (offset + size <= stash.size()) {
+                memcpy(stash.data() + offset, data, size);
+            } else {
+                fprintf(stderr,
+                    "RKNPU2 WARNING: set_tensor tensor=%s -- fix5b host-weight "
+                    "stash write out of range (offset=%zu size=%zu total=%zu); "
+                    "skipping stash for this chunk, get_tensor's verbatim "
+                    "readback for this tensor will be incomplete/stale\n",
+                    tensor->name, offset, size, total);
+            }
+        }
+
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
         const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
@@ -1694,6 +1782,26 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         }
         memcpy(data, (uint8_t*)tensor->data + offset, size);
         return;
+    }
+
+    // npu_fix5b_keep_host_weights_20260902: if this tensor's original
+    // host-side bytes were stashed by set_tensor() (GGML_RKNPU_KEEP_HOST_WEIGHTS
+    // enabled), return them verbatim instead of reconstructing the weight
+    // from the chip-native quantized/Hadamard layout below. This makes a
+    // readback-sensitive caller's CPU reference exact (identical to what
+    // set_tensor() was actually called with), so any remaining NPU-vs-CPU
+    // delta is genuine NPU compute error (weight-quant + activation-quant +
+    // hardware accumulation), not an artifact of re-deriving and
+    // re-quantizing the weight for the comparison. Takes priority over the
+    // FP16 and fix5 INT8/INT4 reconstruction paths below; falls through to
+    // them (then to the raw-bytes memcpy) if the stash is missing/stale for
+    // this tensor, e.g. env was enabled after this tensor's set_tensor().
+    if (rknpu2_keep_host_weights_enabled()) {
+        auto hit = ctx->host_weight_bytes.find(tensor);
+        if (hit != ctx->host_weight_bytes.end() && offset + size <= hit->second.size()) {
+            memcpy(data, hit->second.data() + offset, size);
+            return;
+        }
     }
 
     // Stage-5 fix (rk3576-stage5-20260828): for a "pipeline" tensor (a
@@ -2217,10 +2325,33 @@ static const char * ggml_backend_rknpu_reg_get_name(ggml_backend_reg_t reg) {
 
 static size_t ggml_backend_rknpu_reg_get_device_count(ggml_backend_reg_t reg) {
     UNUSED(reg);
+    // npu_fix5b_disable_device_20260902: GGML_RKNPU_DISABLE=1 (or
+    // RKNPU_DEVICE=none/off/disable) makes this backend enumerate zero
+    // devices, so callers that walk ggml_backend_dev_count()/
+    // ggml_backend_dev_get() -- including llama.cpp's own model-loading
+    // device list -- never see an RKNPU device and no tensor can be placed
+    // on it. Unlike `-ngl 0`/`-dev none`, this is not bypassed by this
+    // backend registering as GGML_BACKEND_DEVICE_TYPE_ACCEL (see
+    // ggml_backend_rknpu_device_get_type below): device-list filtering in
+    // llama.cpp only prunes GPU-type offload devices, which is why
+    // `-dev none -ngl 0` still allocated a full "RKNPU model buffer" in the
+    // fix5_ppl_cpu_v1/v2 evidence -- this gate acts one layer earlier, at
+    // enumeration, so no such filtering logic needs to know about ACCEL
+    // devices at all.
+    if (rknpu2_device_disabled()) {
+        return 0;
+    }
     return 1;
 }
 
 static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t reg, size_t index) {
+    // Defense in depth: get_device_count()==0 already means well-behaved
+    // callers never call this with index==0, but guard directly too in case
+    // some caller caches an old count or calls get_device() without
+    // checking get_device_count() first.
+    if (rknpu2_device_disabled()) {
+        return NULL;
+    }
     if (index != 0) {
         return NULL;
     }
