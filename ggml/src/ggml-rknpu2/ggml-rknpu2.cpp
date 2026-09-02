@@ -663,10 +663,33 @@ static void* get_tensor_real_ptr(const struct ggml_tensor* tensor) {
 }
 
 // Function for getting buffer from cache or creating new one
+//
+// a_buffer_cache / c_buffer_cache entries outlive any single matmul_ctx:
+// they are keyed by (M, K/N, type, domain) -- not by which rknpu_matmul_context
+// created them -- and matmul_ctx_cache entries can be erased mid-run by
+// invalidate_matmul_ctx_for_address() (buffer teardown, Stage-4 fix), which
+// drops the owning rknpu_matmul_context and, once its refcount hits zero,
+// calls rknn_matmul_destroy(ctx) in ~rknpu_matmul_context. Previously this
+// function captured only the raw rknn_matmul_ctx handle (by value) in the
+// mem's deleter; if the owning rknpu_matmul_context was destroyed while a
+// cached buffer created against it was still live, that captured handle
+// went stale, and calling rknn_destroy_mem() on it later (a subsequent
+// eviction, or backend teardown -- see ~ggml_backend_rknpu_context) read
+// through the already-freed librknnrt context and crashed with a SEGV deep
+// inside rknn_destroy_mem (rk3588-fix2-teardown-destroy-order-20260902,
+// ASAN: SEGV on unknown address 0x1783 in rknn_destroy_mem, called from the
+// shared_ptr<_rknn_tensor_memory> deleter tearing down a_buffer_cache /
+// c_buffer_cache). Taking (and capturing) the owning rknpu_matmul_context by
+// shared_ptr instead of its raw ctx handle keeps that context alive for as
+// long as any buffer created against it is cached -- so rknn_destroy_mem
+// always runs against a still-live ctx, and only after it returns can the
+// captured shared_ptr's refcount drop, letting rknn_matmul_destroy() run.
+// This fixes both the mid-run-invalidation case and backend teardown,
+// regardless of unordered_map/member destruction order.
 template <typename CacheKeyType>
 static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
     ggml_backend_rknpu_context* backend_ctx,
-    rknn_matmul_ctx matmul_ctx,
+    const std::shared_ptr<rknpu_matmul_context>& matmul_ctx_owner,
     size_t size,
     const CacheKeyType& key,
     std::unordered_map<CacheKeyType, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
@@ -679,12 +702,12 @@ static std::shared_ptr<rknn_tensor_mem> get_tensor_buffer(
         }
     }
 
-    rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
+    rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx_owner->ctx, size);
     if (!mem) { return nullptr; }
 
-    auto deleter = [matmul_ctx](rknn_tensor_mem* m) {
+    auto deleter = [matmul_ctx_owner](rknn_tensor_mem* m) {
         if (m != 0) {
-            rknn_destroy_mem(matmul_ctx, m);
+            rknn_destroy_mem(matmul_ctx_owner->ctx, m);
         }
     };
 
@@ -911,7 +934,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 auto& matmul_ctx_0 = matmul_ctxs[0];
 
                 // Getting A-buffer from cache
-                mem_A_shared = get_tensor_buffer(backend_ctx, matmul_ctx_0->ctx, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+                mem_A_shared = get_tensor_buffer(backend_ctx, matmul_ctx_0, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
                 if (!mem_A_shared) return GGML_STATUS_FAILED;
 
                 const float* x = (const float*)get_tensor_real_ptr(src1);
@@ -985,7 +1008,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     auto cache_key = std::make_tuple(M_op, active_n_segments[idx].size_n, active_n_segments[idx].core_id, (int)pipeline->npu_type_c, b_domain_id);
 
                     // Getting C-buffer from cache
-                    mem_C_segments[idx] = get_tensor_buffer(backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                    mem_C_segments[idx] = get_tensor_buffer(backend_ctx, matmul_ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
                     if (!mem_C_segments[idx]) return GGML_STATUS_FAILED;
 
                     // Assigning C-matrix to current context for the parallel execution
