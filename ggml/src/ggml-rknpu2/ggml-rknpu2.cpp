@@ -6,6 +6,7 @@
 #include "rknpu2-quantization.h"
 #include "rknpu2-calibration.h"
 #include "rknpu2-configuration.h"
+#include "rknpu2-smoothquant.h"
 
 #include <rknn_api.h>
 #include <rknn_matmul_api.h>
@@ -713,6 +714,12 @@ static const char * ggml_backend_rknpu_name(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rknpu_free(ggml_backend_t backend) {
+    // npu_fix12_smoothquant_20260902: flush any GGML_RKNPU2_CALIB-recorded
+    // per-input-channel max|A_k| stats to disk exactly once, at backend
+    // teardown. A no-op (single cached-bool branch) when GGML_RKNPU2_CALIB
+    // is unset or nothing was recorded.
+    rknpu2_smoothquant::dump_calibration();
+
     ggml_backend_rknpu_context * ctx = (ggml_backend_rknpu_context *)backend->context;
     delete ctx;
     delete backend;
@@ -1138,6 +1145,38 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         memcpy(ready_row.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
                     } else {
                         memcpy(ready_row.data(), src_row + k_seg.offset_k, K_seg_op * sizeof(float));
+                    }
+
+                    // npu_fix12_smoothquant_20260902: two independent,
+                    // env-gated, opt-in hooks around the INT8-activation
+                    // amax/quantize step below -- zero cost (single
+                    // cached-bool branch each) unless GGML_RKNPU2_CALIB or
+                    // GGML_RKNPU2_SMOOTH is set. Both only apply to the
+                    // INT8-activation, non-Hadamard pipelines this fix
+                    // targets (see rknpu2-smoothquant.h).
+                    if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 && !is_hadamard) {
+                        // Recording mode: accumulate this row's contribution
+                        // to src0's per-input-channel max|A_k| BEFORE any
+                        // smoothing divide below, so a GGML_RKNPU2_CALIB run
+                        // (GGML_RKNPU2_SMOOTH unset) measures the true
+                        // unsmoothed activation distribution.
+                        if (rknpu2_smoothquant::calib_enabled()) {
+                            rknpu2_smoothquant::record_activation(src0, k_seg.offset_k, ready_row.data(), K_seg_op);
+                        }
+                        // Apply mode: divide by the same s_k the weight side
+                        // (ggml_backend_rknpu_buffer_set_tensor) already
+                        // folded into src0's weight tile at load time, so
+                        // the amax_m/scales_A[m] computation right below
+                        // (unchanged) runs on the smoothed row.
+                        if (rknpu2_smoothquant::smooth_enabled()) {
+                            const std::vector<float>* s = rknpu2_smoothquant::lookup_s(src0);
+                            if (s != nullptr) {
+                                for (int kk = 0; kk < K_seg_op; ++kk) {
+                                    const int k = k_seg.offset_k + kk;
+                                    if ((size_t)k < s->size()) ready_row[kk] /= (*s)[k];
+                                }
+                            }
+                        }
                     }
 
                     // Handling types and quantizations
@@ -1806,6 +1845,48 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         // true for how K/V-cache tensors reach this backend; a future
         // incremental (row-at-a-time) KV-cache write path through this
         // buffer type would need separate handling, out of scope here.
+
+        // npu_fix12_smoothquant_20260902: GGML_RKNPU2_SMOOTH pre-pass.
+        // Finds this tensor's per-input-channel max|W_k| by dequantizing
+        // every segment the exact same way the real pass below does (same
+        // dequantize_tensor_segment() call), just discarding each tile
+        // instead of continuing on to fix8's scale/quantize/pack steps, so
+        // rknpu2_smoothquant::compute_and_cache_s() can fold it against the
+        // loaded max|A_k| stats into a finalized s_k BEFORE the real pass's
+        // fold (see the insertion right before "Calculating local scale of
+        // the block." below, which is a pure lookup of what this pre-pass
+        // caches here). Only for the INT8-activation, non-Hadamard
+        // pipelines this fix targets -- zero cost otherwise (single
+        // cached-bool branch via smooth_enabled()). Runs once per
+        // set_tensor call (model load), never in the per-token decode
+        // path. K_op==K always here: use_hadamard is false whenever this
+        // branch is taken.
+        if (rknpu2_smoothquant::smooth_enabled() &&
+            pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 &&
+            !pipeline->use_hadamard) {
+            std::vector<float> w_col_absmax((size_t)K, 0.0f);
+            std::vector<float> stats_seg_fp32;
+            for (int64_t si3 = 0; si3 < tensor->ne[3]; ++si3) {
+            for (int64_t si2 = 0; si2 < tensor->ne[2]; ++si2) {
+                const void* stats_slice_raw_data = (const uint8_t*)data + si3 * tensor->nb[3] + si2 * tensor->nb[2];
+                for (const auto& sk_seg : k_segments) {
+                    for (const auto& sn_seg : n_segments) {
+                        if (sn_seg.size_n == 0) continue;
+                        dequantize_tensor_segment(stats_seg_fp32, tensor, ctx, stats_slice_raw_data, K, N, K_op, sk_seg, sn_seg, pipeline->use_hadamard);
+                        for (int i = 0; i < sn_seg.size_n; ++i) {
+                            const float* row = stats_seg_fp32.data() + (size_t)i * sk_seg.size_k;
+                            for (int kk = 0; kk < sk_seg.size_k; ++kk) {
+                                const int k = sk_seg.offset_k + kk;
+                                if (k < K) w_col_absmax[k] = std::max(w_col_absmax[k], std::fabs(row[kk]));
+                            }
+                        }
+                    }
+                }
+            }
+            }
+            rknpu2_smoothquant::compute_and_cache_s(tensor, w_col_absmax.data(), K);
+        }
+
         for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
         for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
         const void* slice_raw_data = (const uint8_t*)data + i3 * tensor->nb[3] + i2 * tensor->nb[2];
@@ -1836,6 +1917,31 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                             if (ncols > 0) {
                                 memcpy(&dbuf[(size_t)global_n * K + k_seg.offset_k],
                                        &seg_fp32[(size_t)i * k_seg.size_k], ncols * sizeof(float));
+                            }
+                        }
+                    }
+                }
+
+                // npu_fix12_smoothquant_20260902: fold per-input-channel
+                // smoothing into the weight tile before the per-channel
+                // absmax below is computed, so that amax already reflects
+                // post-smoothing magnitudes. seg_fp32 layout: row i (local
+                // output channel within this n_seg) * k_seg.size_k + kk
+                // (local column); global input channel k = k_seg.offset_k +
+                // kk, matching the s_k vector's indexing (size K,
+                // K == tensor->ne[0]). s_k was computed once above by the
+                // GGML_RKNPU2_SMOOTH pre-pass -- this is a pure lookup.
+                if (rknpu2_smoothquant::smooth_enabled() &&
+                    pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 &&
+                    !pipeline->use_hadamard) {
+                    const std::vector<float>* s = rknpu2_smoothquant::lookup_s(tensor);
+                    if (s != nullptr) {
+                        #pragma omp parallel for
+                        for (int i = 0; i < n_seg.size_n; ++i) {
+                            float* row = seg_fp32.data() + (size_t)i * k_seg.size_k;
+                            for (int kk = 0; kk < k_seg.size_k; ++kk) {
+                                const int k = k_seg.offset_k + kk;
+                                if ((size_t)k < s->size()) row[kk] *= (*s)[k];
                             }
                         }
                     }
