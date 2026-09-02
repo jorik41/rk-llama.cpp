@@ -730,6 +730,24 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
         struct ggml_tensor* dst = node;
 
+        // rknpu2-broadcast-decline-20260902 (mirrors the check added to
+        // ggml_backend_rknpu_device_supports_op() below). This function
+        // derives M purely from src1->ne[1] and never reads nb[2]/nb[3]
+        // anywhere below -- it has zero handling for a batch dimension on
+        // ANY operand. supports_op() is meant to keep such nodes out of
+        // this backend's split entirely, but the two gates are known to be
+        // able to disagree (see MASTERPORT_FIX_REDIAGNOSIS_20260828.md sec
+        // 0/2, where resolve_op_support() and supports_op() diverging on
+        // the same tensor was the root cause of a prior regression) -- so
+        // re-check here rather than trust the caller. continue leaves this
+        // node unexecuted, matching every other decline path in this loop
+        // (zero-dimension, missing pipeline, empty segments).
+        if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            dst->ne[2]  != 1 || dst->ne[3]  != 1) {
+            continue;
+        }
+
         const int M = (int)src1->ne[1];
         const int K = (int)src0->ne[0];
         const int N = (int)src0->ne[1];
@@ -1876,6 +1894,30 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
         case GGML_OP_MUL_MAT: {
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
+
+            // rknpu2-broadcast-decline-20260902 (see companion check in
+            // ggml_backend_rknpu_graph_compute() above). Stage-1 buffer
+            // guard (resolve_op_support, rknpu2-configuration.cpp) only
+            // sees the weight tensor and is blind to GGML's MUL_MAT
+            // broadcast form: a 2-D weight (ne[2]==ne[3]==1) reused
+            // against a batched *activation* tensor (src1/op with ne[2]>1
+            // or ne[3]>1 -- e.g. test-backend-ops bs=[1,1],nr=[4,1], and
+            // real multi-sequence parallel decode). op's ne[2]/ne[3]
+            // mirror src1's for MUL_MAT (dst inherits src1's batch
+            // shape), so checking op here also covers dst at the
+            // graph_compute call site. ggml_backend_rknpu_graph_compute()
+            // (this file, ~line 725) has no i2/i3 loop and no use of
+            // nb[2]/nb[3] anywhere -- it can only correctly execute a
+            // MUL_MAT where every operand is logically 2-D. Decline
+            // (route to CPU) whenever ANY operand carries a batch
+            // dimension, regardless of which operand it lives on. This is
+            // a clean-refusal guard only -- no broadcast compute support
+            // is added.
+            if (src0->ne[2] != 1 || src0->ne[3] != 1 ||
+                src1->ne[2] != 1 || src1->ne[3] != 1 ||
+                op->ne[2]   != 1 || op->ne[3]   != 1) {
+                return false;
+            }
 
             // Searching for available hardware pipeline for this tensor
             const auto* pipeline = config.resolve_op_support(src0);
