@@ -1769,6 +1769,143 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         return;
     }
 
+    // npu_fix5_q4_0_nan_20260902: generalizes the fast readback path above
+    // to the INT8/INT4-weight pipelines (Q8_0/Q6_K/Q4_0 -> W8A8*/W4A4* on
+    // RK3588, W8A16*/W4A16* on RK3576) the TODO below still leaves
+    // uncovered -- this includes every pipeline GGML_TYPE_Q4_0 can resolve
+    // to today (W4A4_HADAMARD / W4A16_HADAMARD are this backend's only
+    // registered Q4_0 patterns, both use_hadamard=true, npu_type_b=INT4).
+    // Root cause of npu_fix5_q4_0_nan_20260902.md's
+    // MUL_MAT(q4_0,m=576,n=512,k=576) NaN: test-backend-ops' CPU reference
+    // is built by reading this weight tensor BACK through this function
+    // (see the Stage-5 comment above); for exactly this npu_type_b/
+    // use_hadamard combination the old code fell straight through to the
+    // raw-bytes memcpy at the bottom of this function, handing the CPU
+    // reference builder the chip-native INT4-packed, Hadamard-transformed
+    // bytes reinterpreted as a block_q4_0 array. A stray reinterpreted
+    // fp16 "d" scale half-word from that mismatched byte layout can decode
+    // to NaN/Inf and poison every weight dequantized from that block --
+    // corrupting only the CPU reference, never the NPU's own output, which
+    // matches the observed evidence exactly (RKNPU=-10.100720, CPU=-nan:
+    // see npu_fix3_plan_20260902.md sec 1). Same unpack_native() primitive
+    // as the block above, extended to: (1) dequantize with this segment's
+    // real per-block scale (ctx->quantized_tensor_scales, unconditionally
+    // populated by set_tensor() for every pipeline, scale==1.0f only for
+    // the FP16 case handled above) instead of a raw bit-reinterpret;
+    // (2) invert the forward Hadamard transform + random sign vector
+    // set_tensor() applied for Hadamard pipelines (fwht_iterative() is its
+    // own inverse up to a factor of K_op when invoked with K==padded_size
+    // -- rknpu2-calibration.cpp -- matching the K_op divisor
+    // graph_compute() already applies to MUL_MAT output for the identical
+    // reason); (3) re-encode the recovered FP32 matrix into the tensor's
+    // own declared block format via ggml_quantize_chunk() (ggml.h, already
+    // visible here via the ggml-quants.h include above) instead of a
+    // type-specific hand-rolled encoder.
+    if (pipeline &&
+        (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8 ||
+         pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT4) &&
+        (tensor->type == GGML_TYPE_Q4_0 || tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q6_K)) {
+        const int K = (int)tensor->ne[0];
+        const int N = (int)tensor->ne[1];
+        const int K_op = pipeline->use_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+
+        int k_limit = config.max_k_limit;
+        if (pipeline->effective_k > 0) {
+            k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
+        }
+        auto k_segments = compute_k_segments(K_op, k_limit, pipeline->k_align);
+        auto n_segments = compute_n_segments(N, config.active_cores, pipeline->n_align);
+
+        // Already under ctx->mutex (locked at function entry above) --
+        // must not re-lock (std::mutex is non-recursive).
+        std::vector<float> block_scales;
+        {
+            auto sit = ctx->quantized_tensor_scales.find(tensor);
+            if (sit != ctx->quantized_tensor_scales.end()) block_scales = sit->second;
+        }
+        std::vector<float> s_vec;
+        if (pipeline->use_hadamard) {
+            auto hit = ctx->hadamard_s_vectors.find(tensor);
+            if (hit != ctx->hadamard_s_vectors.end()) s_vec = hit->second;
+        }
+        const bool undo_transform = pipeline->use_hadamard && !s_vec.empty();
+
+        std::vector<float> full_fp32((size_t)N * K, 0.0f);
+        std::vector<float> transformed;
+        float* stage = full_fp32.data();
+        size_t stage_stride = (size_t)K;
+        if (undo_transform) {
+            transformed.assign((size_t)N * K_op, 0.0f);
+            stage = transformed.data();
+            stage_stride = (size_t)K_op;
+        }
+
+        const uint8_t* read_ptr = (const uint8_t*)it->second.mem->virt_addr;
+        size_t scale_idx = 0;
+        for (const auto& k_seg : k_segments) {
+            for (const auto& n_seg : n_segments) {
+                if (n_seg.size_n == 0) continue;
+                const size_t seg_elements = (size_t)n_seg.size_n * k_seg.size_k;
+                const float scale = (scale_idx < block_scales.size()) ? block_scales[scale_idx] : 1.0f;
+                ++scale_idx;
+
+                const int element_bits = (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) ? 8 : 4;
+                const size_t packed_bytes = (element_bits == 4) ? (seg_elements / 2) : seg_elements;
+
+                std::vector<uint8_t> packed(packed_bytes);
+                unpack_native(packed.data(), read_ptr, k_seg.size_k, pipeline->k_align,
+                               n_seg.size_n, pipeline->n_align, element_bits);
+                read_ptr += packed_bytes;
+
+                for (int i = 0; i < n_seg.size_n; ++i) {
+                    const int global_n = n_seg.offset_n + i;
+                    if (global_n >= N) continue;
+                    float* dst_row = stage + (size_t)global_n * stage_stride + k_seg.offset_k;
+
+                    if (element_bits == 8) {
+                        const int8_t* src = (const int8_t*)packed.data() + (size_t)i * k_seg.size_k;
+                        for (int k = 0; k < k_seg.size_k; ++k) dst_row[k] = (float)src[k] * scale;
+                    } else {
+                        const uint8_t* src = packed.data() + ((size_t)i * k_seg.size_k) / 2;
+                        for (int k = 0; k < k_seg.size_k; k += 2) {
+                            uint8_t b = src[k / 2];
+                            int8_t lo = (int8_t)(b & 0x0F); if (lo >= 8) lo -= 16;
+                            int8_t hi = (int8_t)((b >> 4) & 0x0F); if (hi >= 8) hi -= 16;
+                            dst_row[k] = (float)lo * scale;
+                            if (k + 1 < k_seg.size_k) dst_row[k + 1] = (float)hi * scale;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (undo_transform) {
+            std::vector<float> tmp(K_op);
+            const float inv_K_op = 1.0f / (float)K_op;
+            for (int n = 0; n < N; ++n) {
+                float* row = &transformed[(size_t)n * K_op];
+                rknpu2_calibration::hadamard_transform(tmp.data(), row, K_op, K_op);
+                for (int k = 0; k < K; ++k) {
+                    const float sign = (k < (int)s_vec.size()) ? s_vec[k] : 1.0f;
+                    full_fp32[(size_t)n * K + k] = tmp[k] * inv_K_op * sign;
+                }
+            }
+        }
+
+        std::vector<uint8_t> reencoded(ggml_nbytes(tensor));
+        const size_t written = ggml_quantize_chunk(tensor->type, full_fp32.data(), reencoded.data(), 0, N, K, nullptr);
+        if (written == reencoded.size() && offset + size <= reencoded.size()) {
+            memcpy(data, reencoded.data() + offset, size);
+            return;
+        }
+        fprintf(stderr,
+            "RKNPU2 WARNING: get_tensor tensor=%s -- fix5 reconstruction path "
+            "produced an unexpected size (written=%zu expected=%zu) or an "
+            "out-of-range request (offset=%zu size=%zu); falling back to raw "
+            "native bytes (same limitation as before this fix)\n",
+            tensor->name, written, reencoded.size(), offset, size);
+    }
+
     // TODO(rk3576-stage5): the same class of bug applies to INT8/INT4
     // (Q8_0/Q6_K/Q4_0 weight) pipelines and Hadamard pipelines -- their
     // native packed bytes are handed back unchanged below, which is only
