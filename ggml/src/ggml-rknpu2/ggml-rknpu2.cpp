@@ -2564,16 +2564,89 @@ static void rknpu2_maybe_raise_fd_limit() {
         (unsigned long)old_soft, (unsigned long)target, (unsigned long)rl.rlim_max);
 }
 
+// rk3576-coremask-fix-20260902: this used to default silently to "RK3588"
+// whenever RKNPU_DEVICE was unset. On a mixed RK3576/RK3588 fleet that
+// silently selects the wrong Rknpu2DeviceConfig (active_cores={0,1,2}
+// instead of RK3576's {0,1} -- rknpu2-configuration.cpp) for any process
+// launched without an explicit export. compute_n_segments() (above) then
+// splits N into config.active_cores.size() segments and assigns
+// core_id=active_cores[i] per segment; with the wrongly-selected 3-core
+// config, any N large enough to produce a non-empty 3rd segment (real
+// model weight matrices -- test-backend-ops' small synthetic N shapes
+// mostly don't reach this) makes get_matmul_ctx()'s switch(core_id) above
+// pass core_id=2 -> RKNN_NPU_CORE_2 -> mask 4, which the RK3576 NPU
+// firmware (2 cores, masks 1/2/3 only) rejects as "Illegal job core_mask
+// 4", leaving that job's C-buffer unwritten -- silent garbage, not a
+// crash. Confirmed on hardware in the 2026-09-02 evidence window: a shell
+// that exported RKNPU_DEVICE=RK3576 before test-backend-ops (fix4_tbo.log)
+// logged zero such errors, while llama-bench/llama-perplexity runs in the
+// same window that did not (bench_npu_20260902.err, ppl_npu_20260902.log)
+// logged 45,440 of them and produced NPU PPL=970949 against CPU PPL=4.997
+// -- this was never a code regression between commits, it is a
+// launch-environment footgun this backend should not expose. Auto-detect
+// from the kernel-provided /proc/device-tree/compatible (present on every
+// mainline/vendor RK3576 and RK3588 kernel; the matmul-only SDK header
+// bundled here has no chip-identity query) so the backend is correct by
+// default; RKNPU_DEVICE remains a valid explicit override. If neither is
+// available, fail closed (return NULL, loud stderr) instead of silently
+// guessing a chip -- silently running the wrong core topology is exactly
+// the failure this closes, not one to leave as a fallback.
+static std::string rknpu2_detect_device_from_devicetree() {
+    FILE* f = fopen("/proc/device-tree/compatible", "rb");
+    if (!f) return "";
+    char buf[512];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return "";
+    buf[n] = '\0';
+    // The file is a sequence of NUL-terminated strings, most-specific
+    // board first and SoC family later (e.g. "friendlyarm,nanopi-rk3576\0
+    // rockchip,rk3576\0"); scan all of them, don't assume a position.
+    for (size_t i = 0; i < n; ) {
+        const char* tok = buf + i;
+        size_t len = strnlen(tok, n - i);
+        std::string s(tok, len);
+        if (s.find("rk3576") != std::string::npos) return "RK3576";
+        if (s.find("rk3588") != std::string::npos) return "RK3588";
+        i += len + 1;
+    }
+    return "";
+}
+
 static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     UNUSED(dev);
     UNUSED(params);
 
     rknpu2_maybe_raise_fd_limit();
 
-    // Fetch device from environment variable, default to RK3588 if not set
+    // Device selection: an explicit RKNPU_DEVICE always wins (dev/debug
+    // override); otherwise auto-detect from the device tree; otherwise
+    // fail closed instead of guessing (see comment above).
     const char* env_device = std::getenv("RKNPU_DEVICE");
-    std::string target_device = env_device ? env_device : "RK3588";
-    if (!rknpu2_configuration::Rknpu2ConfigManager::get_instance().select_device(target_device)) return NULL;
+    std::string target_device;
+    if (env_device != nullptr && env_device[0] != '\0') {
+        target_device = env_device;
+    } else {
+        target_device = rknpu2_detect_device_from_devicetree();
+        if (target_device.empty()) {
+            fprintf(stderr,
+                "RKNPU2: RKNPU_DEVICE is not set and the NPU chip could not "
+                "be auto-detected from /proc/device-tree/compatible -- "
+                "refusing to guess (a wrong guess silently selects the "
+                "wrong core topology and corrupts NPU output; see "
+                "rk3576-coremask-fix-20260902). Set RKNPU_DEVICE=RK3576 or "
+                "RKNPU_DEVICE=RK3588 explicitly.\n");
+            return NULL;
+        }
+        fprintf(stderr, "RKNPU2: auto-detected device '%s' from "
+            "/proc/device-tree/compatible (set RKNPU_DEVICE to override)\n",
+            target_device.c_str());
+    }
+    if (!rknpu2_configuration::Rknpu2ConfigManager::get_instance().select_device(target_device)) {
+        fprintf(stderr, "RKNPU2: RKNPU_DEVICE='%s' has no matching device "
+            "config registered\n", target_device.c_str());
+        return NULL;
+    }
 
     ggml_backend_rknpu_context * ctx = new ggml_backend_rknpu_context();
     g_active_rknpu_backend_ctx = ctx;
