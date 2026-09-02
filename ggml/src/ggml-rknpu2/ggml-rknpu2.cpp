@@ -30,6 +30,8 @@
 #include <sstream>
 #include <cmath>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 
 #define UNUSED(x) (void)(x)
 
@@ -64,20 +66,6 @@ static bool rknpu2_keep_host_weights_enabled() {
     return v == 1;
 }
 
-// npu_fix5b_disable_device_20260902: test/diagnosis-only opt-in to make the
-// RKNPU backend register zero devices, so it never appears in
-// ggml_backend_dev_count()/ggml_backend_dev_get() enumeration and no model
-// tensor can be placed on it -- a real CPU-only run, unlike `-ngl 0`/
-// `-dev none`, which only prune GPU-type offload devices and do not affect
-// this backend's ACCEL-type device (ggml_backend_rknpu_device_get_type()
-// returns GGML_BACKEND_DEVICE_TYPE_ACCEL, which llama.cpp's `-dev`/`-ngl`
-// device-list filtering does not gate -- confirmed by fix5_ppl_cpu_v1/v2
-// still allocating a full "RKNPU model buffer" with both flags passed).
-// Reuses RKNPU_DEVICE="none" (already-read env var, see
-// ggml_backend_rknpu_device_init_backend below) as an alternate spelling so
-// a single env var can express "no RKNPU device" end to end; adds a
-// dedicated GGML_RKNPU_DISABLE for callers that would rather not overload
-// RKNPU_DEVICE's existing "pick a chip variant" meaning.
 static bool rknpu2_device_disabled() {
     static int v = -1;
     if (v == -1) {
@@ -92,6 +80,26 @@ static bool rknpu2_device_disabled() {
             }
         }
         v = disabled ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// fix10-profile-20260902: per-stage host-side timing instrumentation for
+// ggml_backend_rknpu_graph_compute(), gated behind GGML_RKNPU2_PROFILE=1.
+// Unset (the default): rknpu2_profile_enabled() is one cached branch, and
+// every timed block in graph_compute() is wrapped in `if (prof)`, so the
+// only unconditional cost when disabled is that one already-cached bool
+// check per block -- no std::chrono::steady_clock::now() call, no counter
+// update, no allocation. See npu_fix10_nanopi_port_20260902.md sec on
+// GGML_RKNPU2_PROFILE for the five stages measured (B-bind, A-prep, A
+// set_io_mem+sync, rknn_matmul_run, C sync+descale) and the summary-table
+// print points (one line per token to stderr, plus a lifetime summary at
+// backend free).
+static bool rknpu2_profile_enabled() {
+    static int v = -1;
+    if (v == -1) {
+        const char* e = std::getenv("GGML_RKNPU2_PROFILE");
+        v = (e != nullptr && e[0] != '\0' && e[0] != '0') ? 1 : 0;
     }
     return v == 1;
 }
@@ -594,6 +602,19 @@ struct rknpu_matmul_context {
     bool b_bound = false;
     std::shared_ptr<rknn_tensor_mem> mem_B;
 
+    // fix10-host-roundtrip-20260902: identity of the last rknn_tensor_mem
+    // bound to this context's A io slot via rknn_matmul_set_io_mem. The
+    // A-buffer handed in each graph_compute() call comes from
+    // backend_ctx->a_buffer_cache, keyed by (M_op, K_seg_op, npu_type_a,
+    // domain) -- for a steady decode loop (stable M/K/type/domain across
+    // tokens) get_tensor_buffer() returns the SAME rknn_tensor_mem object
+    // every token, yet the call site unconditionally re-issued
+    // rknn_matmul_set_io_mem(A) every token for every active N segment.
+    // mem_B already avoids this exact redundant rebind via b_bound; mirror
+    // it here for A. Raw pointer only (identity check) -- ownership stays
+    // with the shared_ptr in a_buffer_cache / mem_A_shared.
+    rknn_tensor_mem* a_bound_mem = nullptr;
+
     rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, int32_t domain_id) {
         memset(&info, 0, sizeof(info));
         info.M = M;
@@ -638,6 +659,19 @@ struct ggml_backend_rknpu_context {
 
     // C-matrices cache (M, N, core_id, npu_type_c, domain_id)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
+
+    // fix10-profile-20260902: lifetime accumulators for GGML_RKNPU2_PROFILE=1
+    // (stage names match the per-token stderr line graph_compute() prints).
+    // graph_compute() is called serially (never re-entered concurrently for
+    // one backend instance), so plain counters are sufficient -- no atomics,
+    // no locking. Only ever written/read when rknpu2_profile_enabled().
+    uint64_t prof_b_bind_ns = 0;
+    uint64_t prof_a_prep_ns = 0;
+    uint64_t prof_a_bind_ns = 0;
+    uint64_t prof_run_ns = 0;
+    uint64_t prof_c_ns = 0;
+    uint64_t prof_n_matmul = 0;
+    uint64_t prof_n_tokens = 0;
 
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(uintptr_t tensor_id, size_t offset, int M, int K, int N, int core_id, rknn_matmul_type type, int32_t domain_id) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -713,6 +747,32 @@ static const char * ggml_backend_rknpu_name(ggml_backend_t backend) {
     return "RKNPU";
 }
 
+// fix10-profile-20260902: prints the lifetime GGML_RKNPU2_PROFILE summary
+// table for one backend instance to stderr. Called from
+// ggml_backend_rknpu_free() (process/backend teardown) so a normal run
+// always gets one final table even if nothing else polls it; graph_compute()
+// separately prints one raw per-token line every call (see its own comment)
+// for finer-grained inspection without waiting for teardown.
+static void rknpu2_print_profile_summary(const ggml_backend_rknpu_context* ctx) {
+    if (ctx->prof_n_tokens == 0) return;
+    const double to_us = 1e-3;
+    fprintf(stderr,
+        "[RKNPU2_PROFILE] ==== summary: tokens=%llu n_matmul=%llu ====\n"
+        "[RKNPU2_PROFILE] stage        total_us      avg_us/token\n"
+        "[RKNPU2_PROFILE] b_bind    %14.1f  %14.3f\n"
+        "[RKNPU2_PROFILE] a_prep    %14.1f  %14.3f\n"
+        "[RKNPU2_PROFILE] a_bind    %14.1f  %14.3f\n"
+        "[RKNPU2_PROFILE] run       %14.1f  %14.3f\n"
+        "[RKNPU2_PROFILE] c_stage   %14.1f  %14.3f\n",
+        (unsigned long long)ctx->prof_n_tokens, (unsigned long long)ctx->prof_n_matmul,
+        ctx->prof_b_bind_ns * to_us, ctx->prof_b_bind_ns * to_us / (double)ctx->prof_n_tokens,
+        ctx->prof_a_prep_ns * to_us, ctx->prof_a_prep_ns * to_us / (double)ctx->prof_n_tokens,
+        ctx->prof_a_bind_ns * to_us, ctx->prof_a_bind_ns * to_us / (double)ctx->prof_n_tokens,
+        ctx->prof_run_ns    * to_us, ctx->prof_run_ns    * to_us / (double)ctx->prof_n_tokens,
+        ctx->prof_c_ns      * to_us, ctx->prof_c_ns      * to_us / (double)ctx->prof_n_tokens);
+    fflush(stderr);
+}
+
 static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     // npu_fix12_smoothquant_20260902: flush any GGML_RKNPU2_CALIB-recorded
     // per-input-channel max|A_k| stats to disk exactly once, at backend
@@ -721,6 +781,15 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
     rknpu2_smoothquant::dump_calibration();
 
     ggml_backend_rknpu_context * ctx = (ggml_backend_rknpu_context *)backend->context;
+    if (rknpu2_profile_enabled()) {
+        rknpu2_print_profile_summary(ctx);
+    }
+    // Stage-2.5 hardening (defensive, separate hazard from the reorder
+    // above): clear the dangling process-global before delete so no later
+    // reader (e.g. a -j>1 / multi-init caller) can dereference a freed ctx.
+    if (g_active_rknpu_backend_ctx == ctx) {
+        g_active_rknpu_backend_ctx = nullptr;
+    }
     delete ctx;
     delete backend;
 }
@@ -809,6 +878,19 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
     // Getting the current device configuration once
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
+
+    // fix10-profile-20260902: GGML_RKNPU2_PROFILE=1 per-stage timing, zero
+    // cost when unset -- `prof` is a single cached-bool check, and every
+    // timed block below is wrapped `if (prof) { ...steady_clock::now()... }`,
+    // so with the env var unset no clock is ever read and no counter is
+    // ever touched. Accumulated locally across this one graph_compute() call
+    // (one token's worth of MUL_MAT nodes x K-segments), folded into
+    // backend_ctx's lifetime totals and printed as one raw line at the end
+    // of this call; ggml_backend_rknpu_free() prints the lifetime summary
+    // table built from those same backend_ctx accumulators.
+    const bool prof = rknpu2_profile_enabled();
+    uint64_t prof_b_bind_ns = 0, prof_a_prep_ns = 0, prof_a_bind_ns = 0, prof_run_ns = 0, prof_c_ns = 0;
+    uint64_t prof_n_matmul_this_call = 0;
 
     for (int node_i = 0; node_i < cgraph->n_nodes; node_i++) {
         struct ggml_tensor* node = cgraph->nodes[node_i];
@@ -1024,6 +1106,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
         else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
 
+        // fix10-profile-20260902: this node has cleared every decline gate
+        // above and is genuinely dispatched to the NPU -- count it once per
+        // node (not per K-segment) as this call's matmul-node count.
+        if (prof) ++prof_n_matmul_this_call;
+
         // Computing K dimensions segments. rknpu2-broadcast-mulmat-20260902
         // (fix #6): starts at this slice's own base offset within the
         // shared packed buffer (0 for the common non-batch case, where
@@ -1036,6 +1123,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // ===========================================
             // ========== 1. Preparing Contexts ==========
             // ===========================================
+            std::chrono::steady_clock::time_point prof_t_bbind_start;
+            if (prof) prof_t_bbind_start = std::chrono::steady_clock::now();
             for (const auto& n_seg : all_n_segments) {
                 for (size_t idx = 0; idx < num_active_segments; ++idx) {
                     if (active_n_segments[idx].offset_n == n_seg.offset_n) {
@@ -1107,6 +1196,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     current_offset_in_tensor += type_size_packed > 0 ? (size_t)n_seg.size_n * K_seg_op * type_size_packed : (size_t)n_seg.size_n * K_seg_op / 2;
                 }
             }
+            if (prof) prof_b_bind_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_t_bbind_start).count();
 
             // ===========================================
             // ========== 2. Preparing A-matrix ==========
@@ -1130,21 +1220,39 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 const int row_stride = (int)(src1->nb[1] / sizeof(float));
                 void* dst_base = mem_A_shared->virt_addr;
 
+                std::chrono::steady_clock::time_point prof_t_aprep_start;
+                if (prof) prof_t_aprep_start = std::chrono::steady_clock::now();
                 #pragma omp parallel for
                 for (int m = 0; m < M; ++m) {
                     const float* src_row = x + (size_t)m * row_stride;
-                    std::vector<float> ready_row(K_seg_op);
 
-                    // Applying Hadamard Transform
+                    // fix10-host-roundtrip-20260902: the non-Hadamard path
+                    // (the common case -- only pipelines with use_hadamard
+                    // set take the other branch) used to memcpy K_seg_op
+                    // floats into a freshly heap-allocated `ready_row`
+                    // per m-iteration purely so the conversion calls below
+                    // had a contiguous pointer -- but src_row + offset_k is
+                    // already contiguous (supports_op requires
+                    // ggml_is_contiguous(src1)), so the copy and the
+                    // allocation both existed only to feed a pointer the
+                    // source already provided. Point `ready_ptr` straight at
+                    // it and skip both. The Hadamard path still needs a real
+                    // transform output buffer; give it thread-local storage
+                    // (thread_local, not a fresh heap vector every m) so it
+                    // is reused across iterations on each OpenMP thread
+                    // instead of allocating/freeing per row.
+                    const float* ready_ptr;
                     if (is_hadamard) {
-                        std::vector<float> signed_row(K);
-                        std::vector<float> full_hadamard_row(K_op);
-                        for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
-                        rknpu2_calibration::hadamard_transform(full_hadamard_row.data(), signed_row.data(), K, K_op);
+                        static thread_local std::vector<float> tls_signed_row;
+                        static thread_local std::vector<float> tls_full_hadamard_row;
+                        tls_signed_row.resize(K);
+                        tls_full_hadamard_row.resize(K_op);
+                        for(int k=0; k<K; ++k) tls_signed_row[k] = src_row[k] * s_vec[k];
+                        rknpu2_calibration::hadamard_transform(tls_full_hadamard_row.data(), tls_signed_row.data(), K, K_op);
 
-                        memcpy(ready_row.data(), full_hadamard_row.data() + k_seg.offset_k, K_seg_op * sizeof(float));
+                        ready_ptr = tls_full_hadamard_row.data() + k_seg.offset_k;
                     } else {
-                        memcpy(ready_row.data(), src_row + k_seg.offset_k, K_seg_op * sizeof(float));
+                        ready_ptr = src_row + k_seg.offset_k;
                     }
 
                     // npu_fix12_smoothquant_20260902: two independent,
@@ -1183,41 +1291,54 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16) {
                         uint16_t* dst_ptr = (uint16_t*)dst_base;
                         uint16_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
-                        rknpu2_quantization::convert_fp32_to_fp16(ready_row.data(), dst_row, K_seg_op);
+                        rknpu2_quantization::convert_fp32_to_fp16(ready_ptr, dst_row, K_seg_op);
                         if (rknpu2_debug_enabled()) {
-                            double dbg_sum = 0; for (int dk = 0; dk < K_seg_op; ++dk) dbg_sum += ready_row[dk];
+                            double dbg_sum = 0; for (int dk = 0; dk < K_seg_op; ++dk) dbg_sum += ready_ptr[dk];
                             fprintf(stderr, "[RKNPU2_DBG] A-CONV m=%d K_seg_op=%d k_off=%d src_first=%.6f src_last=%.6f src_sum=%.6f conv_first4=%04x,%04x,%04x,%04x conv_last=%04x\n",
-                                m, K_seg_op, k_seg.offset_k, ready_row[0], ready_row[K_seg_op-1], dbg_sum,
+                                m, K_seg_op, k_seg.offset_k, ready_ptr[0], ready_ptr[K_seg_op-1], dbg_sum,
                                 dst_row[0], dst_row[1], dst_row[2], dst_row[3], dst_row[K_seg_op-1]);
                             fflush(stderr);
                         }
                     }
                     else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
                         float amax_m = 0.0f;
-                        for (int k = 0; k < K_seg_op; ++k) amax_m = std::max(amax_m, std::abs(ready_row[k]));
+                        for (int k = 0; k < K_seg_op; ++k) amax_m = std::max(amax_m, std::abs(ready_ptr[k]));
                         scales_A[m] = amax_m / 127.0f;
 
                         int8_t* dst_ptr = (int8_t*)dst_base;
                         int8_t* dst_row = dst_ptr + (size_t)m * K_seg_op;
-                        rknpu2_quantization::quantize_fp32_to_int8(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
+                        rknpu2_quantization::quantize_fp32_to_int8(ready_ptr, dst_row, K_seg_op, scales_A[m]);
                     }
                     else if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
                         float amax_m = 0.0f;
-                        for (int k = 0; k < K_seg_op; ++k) amax_m = std::max(amax_m, std::abs(ready_row[k]));
+                        for (int k = 0; k < K_seg_op; ++k) amax_m = std::max(amax_m, std::abs(ready_ptr[k]));
                         scales_A[m] = amax_m / 7.0f;
 
                         uint8_t* dst_ptr = (uint8_t*)dst_base;
                         uint8_t* dst_row = dst_ptr + (size_t)m * (K_seg_op / 2);
-                        rknpu2_quantization::quantize_fp32_to_int4_packed(ready_row.data(), dst_row, K_seg_op, scales_A[m]);
+                        rknpu2_quantization::quantize_fp32_to_int4_packed(ready_ptr, dst_row, K_seg_op, scales_A[m]);
+                    }
+                }
+                if (prof) prof_a_prep_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_t_aprep_start).count();
+
+                // Assigning A-matrix to all contexts for the parallel execution.
+                // fix10-host-roundtrip-20260902: skip the rknn_matmul_set_io_mem
+                // call when this context's A slot is already bound to the same
+                // rknn_tensor_mem object (mirrors the existing b_bound skip for
+                // B below) -- avoids a per-token, per-active-segment driver call
+                // that does not change any binding in the common (stable
+                // M_op/K_seg_op/type/domain) decode-loop case.
+                std::chrono::steady_clock::time_point prof_t_abind_start;
+                if (prof) prof_t_abind_start = std::chrono::steady_clock::now();
+                for (size_t idx = 0; idx < num_active_segments; idx++) {
+                    if (matmul_ctxs[idx]->a_bound_mem != mem_A_shared.get()) {
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
+                        matmul_ctxs[idx]->a_bound_mem = mem_A_shared.get();
                     }
                 }
 
-                // Assigning A-matrix to all contexts for the parallel execution
-                for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[idx]->ctx, mem_A_shared.get(), &matmul_ctxs[idx]->io_attr.A), "set_io_mem A for core");
-                }
-
                 RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+                if (prof) prof_a_bind_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_t_abind_start).count();
             }
 
             // ===========================================
@@ -1254,6 +1375,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             rb ? [&]{ static char buf[32]; snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x%02x%02x%02x", rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7]); return (const char*)buf; }() : "(null)");
                     }
                 }
+                std::chrono::steady_clock::time_point prof_t_run_start;
+                if (prof) prof_t_run_start = std::chrono::steady_clock::now();
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     int ret = rknn_matmul_run(matmul_ctxs[idx]->ctx);
@@ -1261,12 +1384,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         RKNPU2_DBG("rknn_matmul_run FAILED idx=%zu ret=%d\n", idx, ret);
                     }
                 }
+                if (prof) prof_run_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_t_run_start).count();
             }
 
             // ===========================================
             // ========== 5. Collecting results ==========
             // ===========================================
             {
+                std::chrono::steady_clock::time_point prof_t_c_start;
+                if (prof) prof_t_c_start = std::chrono::steady_clock::now();
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
                     RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
                 }
@@ -1369,10 +1495,30 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             break;
                     }
                 }
+                if (prof) prof_c_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prof_t_c_start).count();
             }
         }
         } // i2 (rknpu2-broadcast-mulmat-20260902, fix #6)
         } // i3 (rknpu2-broadcast-mulmat-20260902, fix #6)
+    }
+
+    // fix10-profile-20260902: fold this call's accumulators into the
+    // backend's lifetime totals and print one raw per-token line. Both
+    // gated behind the same cached `prof` bool checked at function entry --
+    // with GGML_RKNPU2_PROFILE unset this whole block is skipped.
+    if (prof) {
+        backend_ctx->prof_b_bind_ns += prof_b_bind_ns;
+        backend_ctx->prof_a_prep_ns += prof_a_prep_ns;
+        backend_ctx->prof_a_bind_ns += prof_a_bind_ns;
+        backend_ctx->prof_run_ns    += prof_run_ns;
+        backend_ctx->prof_c_ns      += prof_c_ns;
+        backend_ctx->prof_n_matmul  += prof_n_matmul_this_call;
+        backend_ctx->prof_n_tokens  += 1;
+        fprintf(stderr,
+            "[RKNPU2_PROFILE] tok=%llu n_matmul=%llu b_bind_us=%.1f a_prep_us=%.1f a_bind_us=%.1f run_us=%.1f c_us=%.1f\n",
+            (unsigned long long)backend_ctx->prof_n_tokens, (unsigned long long)prof_n_matmul_this_call,
+            prof_b_bind_ns / 1e3, prof_a_prep_ns / 1e3, prof_a_bind_ns / 1e3, prof_run_ns / 1e3, prof_c_ns / 1e3);
+        fflush(stderr);
     }
 
     return GGML_STATUS_SUCCESS;
