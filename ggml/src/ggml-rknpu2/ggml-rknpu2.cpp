@@ -1688,7 +1688,21 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         auto k_segments = compute_k_segments(K, k_limit, pipeline->k_align);
         auto n_segments = compute_n_segments(N, config.active_cores, pipeline->n_align);
 
-        std::vector<uint16_t> full_f16((size_t)N * K, 0);
+        // rk3588-get-tensor-readback-size-20260902: the unpack loop below only
+        // ever fills the first N*K elements (a single 2D (K,N) slice -- the shape
+        // this fast unpack path was proven correct for, see the Stage-5 comment
+        // above). But the caller-supplied `size` (== ggml_nbytes(tensor) for the
+        // common offset=0 full-tensor read, ggml-backend.cpp:401/408) counts ALL
+        // GGML_MAX_DIMS via tensor->nb[] strides, so for a tensor with ne[2] and/or
+        // ne[3] > 1 (e.g. a batched MUL_MAT operand) `size` can be a multiple of
+        // N*K*sizeof(uint16_t) -- ASAN caught the final memcpy below reading past
+        // an 8192-byte allocation for a 24576-byte request (ne[2]==3). Size the
+        // staging allocation from the same expression the final memcpy uses so the
+        // read is always in-bounds; the leading N*K elements stay the proven exact
+        // 2D readback, any elements beyond that (uncovered >2D case) stay
+        // zero-initialized rather than reading out of bounds.
+        const size_t full_elems = std::max<size_t>((size_t)N * K, (offset + size + sizeof(uint16_t) - 1) / sizeof(uint16_t));
+        std::vector<uint16_t> full_f16(full_elems, 0);
         const uint8_t* read_ptr = (const uint8_t*)it->second.mem->virt_addr;
 
         for (const auto& k_seg : k_segments) {
