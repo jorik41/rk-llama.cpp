@@ -3892,6 +3892,76 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// npu_fix9_20260902: same shapes as test_mul_mat, but the activation tensor
+// ("b" -- type_b=F32, the RKNPU2 backend's src1/A-matrix) is filled with a
+// heavy-tailed distribution instead of test_mul_mat's plain uniform: 1% of
+// the K (input-channel) columns get their whole column multiplied by 50x,
+// on every row/token. This mimics the systematic per-channel activation
+// outliers documented in the LLM.int8()/SmoothQuant literature, which
+// uniform random test data structurally cannot trigger (every channel is
+// equally likely to be near-max, so a single per-row absmax scale is never
+// dominated by one channel the way it is with real LLM activations -- see
+// npu_fix9_activation_precision_20260902.md). The weight tensor ("a") is
+// left as plain init_tensor_uniform, unchanged.
+//
+// Diagnostic purpose: W8A8_STANDARD (Q8_0 weight) quantizes this same "b"
+// tensor to INT8 with one scale per row (ggml-rknpu2.cpp:1056-1063,
+// scale_A[m] = amax_m/127.0f over the *whole* row) -- an outlier channel at
+// 50x sets that row's scale, crushing every non-outlier channel's INT8
+// precision to ~1/50th of the already-coarse 8-bit range. W16A16_STANDARD
+// (F16 weight/activation) never quantizes "b" at all, so it should be
+// insensitive to this distribution. Expected result: Q8_0 cases FAIL NMSE
+// under this outlier data (pass under test_mul_mat's plain uniform data,
+// per npu_fix7's 22/22-pass evidence) while paired F16 cases at the same
+// (n,k,m) continue to PASS -- isolating the error to activation
+// quantization specifically, not weight quantization, segmenting, or
+// accumulation (all of which apply equally to both types_a).
+struct test_mul_mat_outlier : public test_mul_mat {
+    using test_mul_mat::test_mul_mat;
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine gen(rd());
+        std::uniform_real_distribution<float> base_dist(-1.0f, 1.0f);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = t->name;
+            if (name != "b" && name != "b_permuted") {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            GGML_ASSERT(t->type == GGML_TYPE_F32);
+            const int64_t k_dim = t->ne[0];
+            const size_t  nels  = ggml_nelements(t);
+            const int64_t rows  = (int64_t)(nels / k_dim);
+
+            std::vector<float> data(nels);
+            for (size_t i = 0; i < nels; ++i) {
+                data[i] = base_dist(gen);
+            }
+
+            // Pick ~1% of the K channels (at least 1) to be outlier channels.
+            const int64_t n_outlier_ch = std::max<int64_t>(1, k_dim / 100);
+            std::vector<int64_t> channels;
+            channels.reserve(k_dim);
+            for (int64_t c = 0; c < k_dim; ++c) {
+                channels.push_back(c);
+            }
+            std::shuffle(channels.begin(), channels.end(), gen);
+            channels.resize(n_outlier_ch);
+
+            for (int64_t r = 0; r < rows; ++r) {
+                for (int64_t ch : channels) {
+                    data[(size_t)r * k_dim + ch] *= 50.0f;
+                }
+            }
+
+            ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
+        }
+    }
+};
+
 static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -8018,6 +8088,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     continue;
                 }
                 test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, n_dim, m_tok, k_dim, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // npu_fix9_20260902: outlier-activation variant of the two shapes most
+    // implicated by the fix7/fix8 evidence -- attn/o-proj a.k.a. the
+    // layer-0 Qcur shape (1536x1536) where the NPU-vs-CPU divergence first
+    // appears, and lm_head (151936x1536), the largest N. Kept to a small
+    // (n,k) x m x type_a grid (2x2x2=8 cases) to bound memory/runtime; see
+    // test_mul_mat_outlier above and
+    // npu_fix9_activation_precision_20260902.md for the full rationale.
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_F16}) {
+        for (auto nk : {std::pair<int64_t,int64_t>{1536, 1536},
+                         std::pair<int64_t,int64_t>{151936, 1536}}) {
+            const int64_t n_dim = nk.first;
+            const int64_t k_dim = nk.second;
+            for (int64_t m_tok : {1, 8}) {
+                test_cases.emplace_back(new test_mul_mat_outlier(type_a, GGML_TYPE_F32, n_dim, m_tok, k_dim, {1, 1}, {1, 1}));
             }
         }
     }

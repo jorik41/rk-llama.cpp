@@ -200,6 +200,38 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .n_align       = */ 64,
             /* .effective_k   = */ 0,
             /* .use_hadamard  = */ true
+        },
+        {
+            // npu_fix9_20260902 QUICK TIER (EXPERIMENTAL, opt-in only via
+            // RKNPU_HYBRID=W8A16_STANDARD -- NOT added to default_patterns
+            // below). Mirrors RK3576's W8A16_STANDARD entry: FP16 activation
+            // x INT8 weight -> FP32, removing INT8 *activation* quantization
+            // (the suspected root cause in
+            // npu_fix9_activation_precision_20260902.md) while keeping Q8_0's
+            // INT8 weight storage. rknn_matmul_api.h defines
+            // RKNN_FLOAT16_MM_INT8_TO_FLOAT32 in the same shared header used
+            // for both RK3588 and RK3576 (no chip-specific #ifdef; the
+            // header's K/N alignment tables document RK3588 and RK3576
+            // jointly throughout), so the enum value itself is available --
+            // but RK3576's own n_align=16 for this pipeline is explicitly
+            // marked EXPERIMENTAL there (maintainer's own board testing, not
+            // the SDK doc table) and has never been settled on RK3588
+            // hardware/this librknnrt build. Do NOT flip
+            // default_patterns[GGML_TYPE_Q8_0] to this pipeline until the
+            // settling test in npu_fix9_activation_precision_20260902.md
+            // (rknn_matmul_create + query real B native-layout dims for
+            // RKNN_FLOAT16_MM_INT8_TO_FLOAT32 on RK3588, off the serving
+            // path, single NPU process per the kernel-panic rule) confirms
+            // n_align/k_align and passes an NMSE check.
+            /* .pipeline_name = */ "W8A16_STANDARD",
+            /* .npu_type_a    = */ NPU_TYPE_FP16,
+            /* .npu_type_b    = */ NPU_TYPE_INT8,
+            /* .npu_type_c    = */ NPU_TYPE_FP32,
+            /* .mm_type       = */ RKNN_FLOAT16_MM_INT8_TO_FLOAT32,
+            /* .k_align       = */ 32,
+            /* .n_align       = */ 16,
+            /* .effective_k   = */ 0,
+            /* .use_hadamard  = */ false
         }
     };
 
@@ -208,6 +240,12 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     rk3588_config.custom_hybrid_pattern = custom_pattern;
 
     // Defining default quantization sequences for each supported ggml_type
+    // NOTE: Q8_0 stays on W8A8_STANDARD by default. W8A16_STANDARD (above)
+    // is registered but deliberately left out of default_patterns until the
+    // settling test + PPL validation in
+    // npu_fix9_activation_precision_20260902.md pass; select it for an A/B
+    // run via RKNPU_HYBRID=W8A16_STANDARD (existing env-override mechanism,
+    // Rknpu2ConfigManager ctor above), no further code change needed.
     rk3588_config.default_patterns[(int)GGML_TYPE_F16]  = {"W16A16_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q8_0] = {"W8A8_STANDARD"};
     rk3588_config.default_patterns[(int)GGML_TYPE_Q6_K] = {"W8A8_STANDARD", "W4A4_HADAMARD"};
