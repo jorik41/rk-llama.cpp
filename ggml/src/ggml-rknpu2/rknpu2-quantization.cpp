@@ -23,10 +23,19 @@ void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements) 
     }
 }
 
+// npu_fix8_20260902: saturating clamp to [-127,127] before the narrowing
+// (int8_t) cast. Without it, float rounding of two independent near-max
+// elements in the same tile can push one to +128, which silently wraps to
+// -128 on the narrowing cast (ARM two's complement) -- a large-magnitude
+// sign-flipped outlier. quantize_fp32_to_int4_packed already clamps its
+// output the same way; this brings the INT8 sibling in line. See
+// npu_fix8_int8_scales_20260902.md hypothesis #2 (== npu_fix7 hypothesis #2).
 void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale) {
     const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
     for (size_t i = 0; i < n_elements; ++i) {
-        dst[i] = (int8_t)roundf(src[i] * iscale);
+        float q = roundf(src[i] * iscale);
+        q = std::max(-127.0f, std::min(127.0f, q));
+        dst[i] = (int8_t)q;
     }
 }
 
