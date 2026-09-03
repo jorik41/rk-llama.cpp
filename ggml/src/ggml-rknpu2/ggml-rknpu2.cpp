@@ -1262,6 +1262,26 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     // GGML_RKNPU2_SMOOTH is set. Both only apply to the
                     // INT8-activation, non-Hadamard pipelines this fix
                     // targets (see rknpu2-smoothquant.h).
+                    //
+                    // fix10-rebase-repair-20260903: fix10's copy-elision
+                    // above deleted the `ready_row` buffer this block was
+                    // originally written against (see fix6/fix12) and left
+                    // only the read-only `ready_ptr` alias into src1's own
+                    // storage (or the shared thread_local Hadamard buffer).
+                    // record_activation() only reads the row, so it takes
+                    // `ready_ptr` directly (it already accepts a bare
+                    // `const float*`). The smoothing divide below mutates
+                    // the row in place, which cannot go through `ready_ptr`
+                    // (const, and would corrupt src1 / the shared Hadamard
+                    // buffer) -- so it needs a real owned copy. `ready_row`
+                    // is declared here, empty, and only actually allocated
+                    // and populated on the one path that mutates
+                    // (smooth_enabled() with a cached s_k for src0);
+                    // `ready_ptr` is then repointed at it so the
+                    // FP16/INT8/INT4 conversion below picks up the smoothed
+                    // values. The common case (SmoothQuant off) still pays
+                    // no copy, preserving fix10's optimization.
+                    std::vector<float> ready_row;
                     if (pipeline->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 && !is_hadamard) {
                         // Recording mode: accumulate this row's contribution
                         // to src0's per-input-channel max|A_k| BEFORE any
@@ -1269,7 +1289,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         // (GGML_RKNPU2_SMOOTH unset) measures the true
                         // unsmoothed activation distribution.
                         if (rknpu2_smoothquant::calib_enabled()) {
-                            rknpu2_smoothquant::record_activation(src0, k_seg.offset_k, ready_row.data(), K_seg_op);
+                            rknpu2_smoothquant::record_activation(src0, k_seg.offset_k, ready_ptr, K_seg_op);
                         }
                         // Apply mode: divide by the same s_k the weight side
                         // (ggml_backend_rknpu_buffer_set_tensor) already
@@ -1279,10 +1299,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         if (rknpu2_smoothquant::smooth_enabled()) {
                             const std::vector<float>* s = rknpu2_smoothquant::lookup_s(src0);
                             if (s != nullptr) {
+                                ready_row.assign(ready_ptr, ready_ptr + K_seg_op);
                                 for (int kk = 0; kk < K_seg_op; ++kk) {
                                     const int k = k_seg.offset_k + kk;
                                     if ((size_t)k < s->size()) ready_row[kk] /= (*s)[k];
                                 }
+                                ready_ptr = ready_row.data();
                             }
                         }
                     }
