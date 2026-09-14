@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
+#include <atomic>
 
 #include "rknpu2-quantization.h"
 #include "rknpu2-calibration.h"
