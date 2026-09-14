@@ -1415,8 +1415,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             {
                 std::chrono::steady_clock::time_point prof_t_c_start;
                 if (prof) prof_t_c_start = std::chrono::steady_clock::now();
+                std::atomic<int> c_sync_error{0};
+                #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
-                    RKNN_CHECK(rknn_mem_sync(matmul_ctxs[idx]->ctx, mem_C_segments[idx].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
+                    int ret = rknn_mem_sync(
+                        matmul_ctxs[idx]->ctx,
+                        mem_C_segments[idx].get(),
+                        RKNN_MEMORY_SYNC_FROM_DEVICE);
+                    if (ret < 0) {
+                        int expected = 0;
+                        c_sync_error.compare_exchange_strong(expected, ret);
+                    }
+                }
+                if (c_sync_error.load() < 0) {
+                    RKNN_LOG_FAILURE(c_sync_error.load(), "sync C FROM_DEVICE (parallel)");
+                    return GGML_STATUS_FAILED;
                 }
 
                 if (rknpu2_debug_enabled() && pipeline->npu_type_c == rknpu2_configuration::NPU_TYPE_FP32) {
