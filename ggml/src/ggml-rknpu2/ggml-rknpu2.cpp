@@ -1416,6 +1416,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             {
                 std::chrono::steady_clock::time_point prof_t_c_start;
                 if (prof) prof_t_c_start = std::chrono::steady_clock::now();
+                // Each segment owns a distinct context and C buffer; synchronize
+                // all segments concurrently instead of waiting on them serially.
                 std::atomic<int> c_sync_error{0};
                 #pragma omp parallel for num_threads(num_active_segments)
                 for (size_t idx = 0; idx < num_active_segments; idx++) {
